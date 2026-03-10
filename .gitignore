@@ -1,0 +1,21 @@
+# Rust build output
+/target/
+
+# Environment and secrets (NEVER commit these!)
+.env
+.env.*
+*.env
+src/.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cargo lock (optional: some prefer to commit for binaries)
+# Cargo.lock

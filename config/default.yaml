@@ -1,0 +1,28 @@
+strategies:
+  arbitrage:
+    enabled: true
+    min_profit_threshold: '0.005'
+    slippage_bps: 10
+    min_liquidity: '100'
+    order_size: '10'
+  probability_trading:
+    enabled: false
+  market_making:
+    enabled: false
+  latency_arbitrage:
+    enabled: false
+
+risk:
+  max_position_pct: '0.02'
+  max_single_trade_pct: '0.005'
+  daily_loss_limit_pct: '0.05'
+
+execution:
+  polymarket_ws_url: 'wss://ws-subscriptions-clob.polymarket.com/ws'
+  polymarket_http_url: 'https://clob.polymarket.com/'
+  api_key_env: 'POLYMARKET_API_KEY'
+  signature_env: 'POLYMARKET_SIGNATURE'
+  max_retries: 3
+  timeout_secs: 10
+  status_poll_attempts: 3
+  status_poll_interval_ms: 500
