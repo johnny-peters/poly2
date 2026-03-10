@@ -45,6 +45,7 @@ pub struct ArbCandidate {
     pub price_a: Decimal,
     pub bid_b: Decimal,
     pub price_b: Decimal,
+    pub volume_24h: Option<Decimal>,
     pub sum: Decimal,
     pub edge: Decimal,
 }
@@ -166,6 +167,7 @@ pub async fn scan_arb_candidates(
             price_a,
             bid_b,
             price_b,
+            volume_24h: extract_volume_24h(m),
             sum,
             edge,
         };
@@ -236,6 +238,16 @@ fn extract_created_at_ms(market: &Value) -> i64 {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.timestamp_millis())
         .unwrap_or(0)
+}
+
+/// Extract 24h volume from Gamma market payload using common key variants.
+fn extract_volume_24h(market: &Value) -> Option<Decimal> {
+    for key in ["volume24hr", "volume24h", "volume24Hr", "oneDayVolume", "volume"] {
+        if let Some(v) = parse_decimal(market.get(key)) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 /// Prefer stable API ids (conditionId / id) over slug/question for consistent position keying.

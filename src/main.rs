@@ -294,7 +294,7 @@ fn to_market_snapshots(candidates: &[poly2::ArbCandidate]) -> Vec<MarketSnapshot
             yes_best_ask: c.price_a,
             no_best_bid: c.bid_b,
             no_best_ask: c.price_b,
-            volume_24h: None,
+            volume_24h: c.volume_24h,
             timestamp: Utc::now(),
         })
         .collect()

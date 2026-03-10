@@ -100,6 +100,7 @@ CLOB_HTTP_URL=https://clob.polymarket.com/
 CLOB_WS_URL=wss://ws-subscriptions-clob.polymarket.com/ws
 RPC_URL=https://polygon-rpc.com
 # USDC_CONTRACT_ADDRESS=...  # 健康检查用，按需
+# FETCH_INTERVAL=60          # 主程序市场扫描间隔（秒），默认 60，按需修改
 ```
 
 ### 3. 验证
@@ -121,9 +122,9 @@ cd /opt/poly2
 
 ---
 
-## 四、以 systemd 服务长期运行（可选）
+## 四、以 systemd 服务长期运行（推荐）
 
-若需要 7×24 运行主程序（而不是仅定时跑 healthcheck/scan-arb），可用 systemd。
+主程序**自带循环**：默认运行时会按 **`FETCH_INTERVAL`**（在 `src/.env` 中配置，单位秒，默认 60）定期扫描市场并执行策略，无需再用 cron 定时拉起。只需用 systemd 保持一个常驻进程即可。
 
 ### 1. 创建服务文件
 
@@ -174,9 +175,11 @@ journalctl -u poly2 -f
 
 ---
 
-## 五、仅定时跑 healthcheck / scan-arb（可选）
+## 五、仅定时跑 healthcheck / scan-arb（可选，仅监控场景）
 
-若只希望定时做健康检查或扫描套利，用 cron 即可。
+**正常部署**：用 systemd 跑主程序，扫描间隔由 `src/.env` 里的 **`FETCH_INTERVAL`** 控制即可，不需要 cron。
+
+只有在**不跑主引擎**、只希望定时执行健康检查或套利扫描（例如单独做监控/告警）时，才用 cron：
 
 ```bash
 crontab -e
