@@ -43,6 +43,8 @@ pub struct ArbCandidate {
     pub market_id: String,
     pub question: String,
     pub market_slug: String,
+    pub yes_token_id: String,
+    pub no_token_id: String,
     pub bid_a: Decimal,
     pub price_a: Decimal,
     pub bid_b: Decimal,
@@ -253,6 +255,8 @@ pub async fn fetch_market_snapshots_by_ids(
         };
         snapshots.push(crate::types::MarketSnapshot {
             market_id: market_id.clone(),
+            yes_token_id: Some(token_a.clone()),
+            no_token_id: Some(token_b.clone()),
             yes_best_bid: bid_a,
             yes_best_ask: price_a,
             no_best_bid: bid_b,
@@ -316,6 +320,8 @@ async fn evaluate_market_for_arb(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        yes_token_id: token_a,
+        no_token_id: token_b,
         bid_a,
         price_a,
         bid_b,

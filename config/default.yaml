@@ -4,7 +4,7 @@ strategies:
     min_profit_threshold: '0.005'
     slippage_bps: 10
     min_liquidity: '100'
-    order_size: '10'
+    order_size: '5'
   probability_trading:
     enabled: false
   market_making:
@@ -13,8 +13,8 @@ strategies:
     enabled: false
 
 risk:
-  max_position_pct: '0.02'
-  max_single_trade_pct: '0.005'
+  max_position_pct: '0.05'
+  max_single_trade_pct: '0.05'
   daily_loss_limit_pct: '0.05'
 
 execution:

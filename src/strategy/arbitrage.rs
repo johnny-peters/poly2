@@ -106,6 +106,8 @@ impl Strategy for ArbitrageStrategy {
         Ok(Some(StrategySignal {
             strategy_id: StrategyId::Arbitrage,
             market_id: snapshot.market_id.clone(),
+            yes_token_id: snapshot.yes_token_id.clone(),
+            no_token_id: snapshot.no_token_id.clone(),
             actions,
             state: StrategyState::Implemented,
         }))

@@ -14,7 +14,8 @@ pub use engine::{EngineError, TradingEngine};
 pub use execution::{
     EventingExecutionClient, ExecutionClient, ExecutionError, ExecutionEvent, ExecutionEventType,
     ExecutionFill, ExecutionReport, ExecutionStatus, FlakyExecutionClient, MockExecutionClient,
-    OrderSignContext, PolymarketHttpExecutionClient, RetryingExecutionClient,
+    OrderSignContext, PolymarketHttpExecutionClient, PolymarketSdkExecutionClient,
+    RetryingExecutionClient,
 };
 pub use persistence::{append_order_record, load_positions, save_positions, OrderRecord, PositionSnapshot};
 pub use position::{PositionManager, PositionPnl};

@@ -20,8 +20,9 @@ use poly2::{
     append_order_record, fetch_market_snapshots_by_ids, load_positions, run_healthcheck,
     save_positions, scan_arb_candidates, AppConfig, ArbitrageStrategy, EngineRunner,
     ExecutionClient, ExecutionReport, ExecutionSettings, MarketSnapshot, MockExecutionClient,
-    PolymarketHttpExecutionClient, RetryingExecutionClient, RiskContext, RiskEngine,
-    StrategyContext, StrategyId, StrategyRegistry, TodoStrategy, TradingEngine,
+    RetryingExecutionClient, RiskContext, RiskEngine,
+    PolymarketSdkExecutionClient, StrategyContext, StrategyId, StrategyRegistry, TodoStrategy,
+    TradingEngine,
 };
 
 #[tokio::main]
@@ -163,32 +164,25 @@ async fn main() -> anyhow::Result<()> {
         let pm_chain_id = read_pm_chain_id(dotenv_path, PM_POLYGON);
         let pm_signature_type = resolve_pm_signature_type(dotenv_path)?;
         let pm_funder = resolve_pm_funder_address(dotenv_path, pm_signature_type, pm_chain_id)?;
-        let mut client = if let Some(env_key) = &execution_settings.api_key_env {
-            PolymarketHttpExecutionClient::new(http_url.clone()).with_api_key_env(env_key)
-        } else {
-            PolymarketHttpExecutionClient::new(http_url.clone())
-        };
-        client = client.with_per_order_retry_policy(
-            execution_settings.max_retries,
-            execution_settings.timeout_secs * 100,
-        );
-        client = client.with_status_polling(
-            execution_settings.status_poll_attempts,
-            execution_settings.status_poll_interval_ms,
-        );
-        if let Some(signature_env) = &execution_settings.signature_env {
-            client = client.with_dynamic_hmac_signature_env(signature_env);
-        }
+        let private_key = resolve_runtime_var(PRIVATE_KEY_VAR, dotenv_path)
+            .or_else(|| resolve_runtime_var("PRIVATE_KEY", dotenv_path))
+            .ok_or_else(|| anyhow!("missing private key: set {PRIVATE_KEY_VAR} or PRIVATE_KEY"))?;
+        let signer = PmLocalSigner::from_str(private_key.trim())
+            .context("invalid private key format")?
+            .with_chain_id(Some(pm_chain_id));
+        let mut auth_builder = PmClobClient::new(http_url, PmClobConfig::default())?
+            .authentication_builder(&signer);
         if let Some(sig) = pm_signature_type {
             println!("pm_signature_type={}", pm_signature_type_to_name(sig));
-            client = client.with_signature_type(sig as u8);
+            auth_builder = auth_builder.signature_type(sig);
         }
         if let Some(funder) = pm_funder {
             println!("pm_funder={funder}");
-            client = client.with_funder(funder.to_string());
+            auth_builder = auth_builder.funder(funder);
         }
+        let sdk_client = auth_builder.authenticate().await?;
         let retrying = RetryingExecutionClient::new(
-            client,
+            PolymarketSdkExecutionClient::new(sdk_client, private_key, pm_chain_id),
             execution_settings.max_retries,
             execution_settings.timeout_secs * 100,
         );
@@ -660,6 +654,8 @@ fn to_market_snapshots(candidates: &[poly2::ArbCandidate]) -> Vec<MarketSnapshot
         .iter()
         .map(|c| MarketSnapshot {
             market_id: c.market_id.clone(),
+            yes_token_id: Some(c.yes_token_id.clone()),
+            no_token_id: Some(c.no_token_id.clone()),
             yes_best_bid: c.bid_a,
             yes_best_ask: c.price_a,
             no_best_bid: c.bid_b,

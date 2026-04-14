@@ -104,6 +104,10 @@ pub struct PositionSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PositionRow {
     pub market_id: String,
+    #[serde(default)]
+    pub yes_token_id: Option<String>,
+    #[serde(default)]
+    pub no_token_id: Option<String>,
     pub qty_yes: String,
     pub qty_no: String,
     pub avg_entry_yes: String,
@@ -120,6 +124,8 @@ impl PositionSnapshot {
                     k.clone(),
                     PositionRow {
                         market_id: p.market_id.clone(),
+                        yes_token_id: p.yes_token_id.clone(),
+                        no_token_id: p.no_token_id.clone(),
                         qty_yes: p.qty_yes.to_string(),
                         qty_no: p.qty_no.to_string(),
                         avg_entry_yes: p.avg_entry_yes.to_string(),
@@ -143,6 +149,8 @@ impl PositionSnapshot {
                 row.market_id.clone(),
                 Position {
                     market_id: row.market_id,
+                    yes_token_id: row.yes_token_id,
+                    no_token_id: row.no_token_id,
                     qty_yes: Decimal::from_str(&row.qty_yes)?,
                     qty_no: Decimal::from_str(&row.qty_no)?,
                     avg_entry_yes: Decimal::from_str(&row.avg_entry_yes)?,

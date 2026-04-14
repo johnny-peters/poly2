@@ -4,6 +4,11 @@ use base64::engine::general_purpose::URL_SAFE;
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use hmac::{Hmac, KeyInit, Mac as _};
+use polymarket_client_sdk::auth::{LocalSigner as PmLocalSigner, Signer as _};
+use polymarket_client_sdk::auth::{Normal as PmAuthNormal, state::Authenticated as PmAuthenticated};
+use polymarket_client_sdk::clob::types::{OrderStatusType as PmOrderStatusType, Side as PmSide};
+use polymarket_client_sdk::clob::Client as PmClobClient;
+use polymarket_client_sdk::types::{Decimal as PmDecimal, U256 as PmU256};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -232,6 +237,127 @@ where
     }
 }
 
+pub struct PolymarketSdkExecutionClient {
+    client: PmClobClient<PmAuthenticated<PmAuthNormal>>,
+    private_key: String,
+    chain_id: u64,
+}
+
+impl PolymarketSdkExecutionClient {
+    pub fn new(
+        client: PmClobClient<PmAuthenticated<PmAuthNormal>>,
+        private_key: impl Into<String>,
+        chain_id: u64,
+    ) -> Self {
+        Self {
+            client,
+            private_key: private_key.into(),
+            chain_id,
+        }
+    }
+
+    fn resolve_token_id(signal: &StrategySignal, side: &Side) -> Result<String, ExecutionError> {
+        let raw = match side {
+            Side::Yes => signal.yes_token_id.clone(),
+            Side::No => signal.no_token_id.clone(),
+        };
+        raw.ok_or_else(|| {
+            ExecutionError::Backend(format!(
+                "missing token id for side {:?} on market {}",
+                side, signal.market_id
+            ))
+        })
+    }
+
+    fn map_status(status: &PmOrderStatusType, success: bool) -> ExecutionStatus {
+        if !success {
+            return ExecutionStatus::Rejected;
+        }
+        match status {
+            PmOrderStatusType::Matched => ExecutionStatus::Filled,
+            PmOrderStatusType::Live | PmOrderStatusType::Delayed => ExecutionStatus::Pending,
+            PmOrderStatusType::Canceled | PmOrderStatusType::Unmatched => ExecutionStatus::Rejected,
+            PmOrderStatusType::Unknown(_) => ExecutionStatus::Pending,
+            _ => ExecutionStatus::Pending,
+        }
+    }
+}
+
+#[async_trait]
+impl ExecutionClient for PolymarketSdkExecutionClient {
+    async fn submit(&self, signal: &StrategySignal) -> Result<ExecutionReport, ExecutionError> {
+        let mut order_ids = Vec::new();
+        let mut fills = Vec::new();
+        let mut final_status = ExecutionStatus::Pending;
+
+        for action in &signal.actions {
+            let token_id_raw = Self::resolve_token_id(signal, &action.side)?;
+            let token_id = PmU256::from_str(token_id_raw.trim()).map_err(|e| {
+                ExecutionError::Backend(format!("invalid token_id '{}' for market {}: {e}", token_id_raw, signal.market_id))
+            })?;
+            let price = PmDecimal::from_str(&action.price.to_string())
+                .map_err(|e| ExecutionError::Backend(format!("invalid order price {}: {e}", action.price)))?;
+            let size = PmDecimal::from_str(&action.size.to_string())
+                .map_err(|e| ExecutionError::Backend(format!("invalid order size {}: {e}", action.size)))?;
+            let side = if action.sell { PmSide::Sell } else { PmSide::Buy };
+
+            let order = self
+                .client
+                .limit_order()
+                .token_id(token_id)
+                .side(side)
+                .price(price)
+                .size(size)
+                .build()
+                .await
+                .map_err(|e| ExecutionError::Backend(format!("build sdk order failed: {e}")))?;
+            let signer = PmLocalSigner::from_str(self.private_key.trim())
+                .map_err(|e| ExecutionError::Backend(format!("invalid private key format: {e}")))?
+                .with_chain_id(Some(self.chain_id));
+            let signed = self
+                .client
+                .sign(&signer, order)
+                .await
+                .map_err(|e| ExecutionError::Backend(format!("sign sdk order failed: {e}")))?;
+            let response = self
+                .client
+                .post_order(signed)
+                .await
+                .map_err(|e| ExecutionError::Backend(format!("post sdk order failed: {e}")))?;
+
+            if !response.success {
+                return Err(ExecutionError::Backend(format!(
+                    "exchange rejected order: status={:?}, error_msg={:?}",
+                    response.status, response.error_msg
+                )));
+            }
+
+            order_ids.push(response.order_id.clone());
+            final_status = Self::map_status(&response.status, response.success);
+            if matches!(final_status, ExecutionStatus::Filled) {
+                fills.push(ExecutionFill {
+                    order_id: Some(response.order_id),
+                    fill_id: None,
+                    side: action.side.clone(),
+                    price: action.price,
+                    size: action.size,
+                    fee: Decimal::ZERO,
+                    sell: action.sell,
+                });
+            }
+        }
+
+        Ok(ExecutionReport {
+            market_id: signal.market_id.clone(),
+            action_count: signal.actions.len(),
+            order_ids,
+            status: final_status,
+            fills,
+            signal: signal.clone(),
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct FlakyExecutionClient {
     fail_times: Arc<Mutex<u32>>,
@@ -297,6 +423,8 @@ pub struct PolymarketHttpExecutionClient {
     http: reqwest::Client,
     api_base_url: String,
     api_key: Option<String>,
+    passphrase: Option<String>,
+    poly_address: Option<String>,
     funder: Option<String>,
     signature_type: Option<u8>,
     per_order_max_retries: u32,
@@ -326,14 +454,10 @@ pub struct OrderSignContext {
 
 #[derive(Clone, Debug, Serialize)]
 struct PolymarketOrderRequest {
-    market_id: String,
+    token_id: String,
     side: String,
     price: String,
     size: String,
-    strategy_id: String,
-    /// "SELL" when closing position; omit or "BUY" when opening.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    order_type: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -399,6 +523,8 @@ impl PolymarketHttpExecutionClient {
             http: reqwest::Client::new(),
             api_base_url: api_base_url.into(),
             api_key: None,
+            passphrase: None,
+            poly_address: None,
             funder: None,
             signature_type: None,
             per_order_max_retries: 0,
@@ -412,6 +538,30 @@ impl PolymarketHttpExecutionClient {
 
     pub fn with_api_key_env(mut self, env_key: &str) -> Self {
         self.api_key = env::var(env_key).ok();
+        self
+    }
+
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        let api_key = api_key.into().trim().to_string();
+        if !api_key.is_empty() {
+            self.api_key = Some(api_key);
+        }
+        self
+    }
+
+    pub fn with_passphrase(mut self, passphrase: impl Into<String>) -> Self {
+        let passphrase = passphrase.into().trim().to_string();
+        if !passphrase.is_empty() {
+            self.passphrase = Some(passphrase);
+        }
+        self
+    }
+
+    pub fn with_poly_address(mut self, address: impl Into<String>) -> Self {
+        let address = address.into().trim().to_string();
+        if !address.is_empty() {
+            self.poly_address = Some(address);
+        }
         self
     }
 
@@ -461,10 +611,18 @@ impl PolymarketHttpExecutionClient {
 
     /// Loads a base64-url encoded CLOB secret from env and signs each request body dynamically.
     /// If decoding fails, falls back to the raw env value to preserve legacy static-signature behavior.
-    pub fn with_dynamic_hmac_signature_env(mut self, env_key: &str) -> Self {
+    pub fn with_dynamic_hmac_signature_env(self, env_key: &str) -> Self {
         let Ok(raw_value) = env::var(env_key) else {
             return self;
         };
+        self.with_dynamic_hmac_signature(raw_value)
+    }
+
+    /// Configure signature provider from raw value directly.
+    /// - If value is base64-url encoded secret, sign each request dynamically.
+    /// - Otherwise treat it as legacy static signature string.
+    pub fn with_dynamic_hmac_signature(mut self, raw_value: impl Into<String>) -> Self {
+        let raw_value = raw_value.into();
         let trimmed = raw_value.trim().to_string();
         if trimmed.is_empty() {
             return self;
@@ -497,24 +655,24 @@ impl PolymarketHttpExecutionClient {
         &self,
         signal: &StrategySignal,
         action: &crate::types::OrderIntent,
-    ) -> PolymarketOrderRequest {
-        let side = match action.side {
-            Side::Yes => "YES",
-            Side::No => "NO",
-        };
-        let order_type = if action.sell {
-            Some("SELL".to_string())
-        } else {
-            None
-        };
-        PolymarketOrderRequest {
-            market_id: signal.market_id.clone(),
+    ) -> Result<PolymarketOrderRequest, ExecutionError> {
+        let token_id = match action.side {
+            Side::Yes => signal.yes_token_id.clone(),
+            Side::No => signal.no_token_id.clone(),
+        }
+        .ok_or_else(|| {
+            ExecutionError::Backend(format!(
+                "missing token id for side {:?} on market {}",
+                action.side, signal.market_id
+            ))
+        })?;
+        let side = if action.sell { "SELL" } else { "BUY" };
+        Ok(PolymarketOrderRequest {
+            token_id,
             side: side.to_string(),
             price: action.price.to_string(),
             size: action.size.to_string(),
-            strategy_id: format!("{:?}", signal.strategy_id),
-            order_type,
-        }
+        })
     }
 
     fn parse_decimal_or(default: Decimal, value: Option<String>) -> Decimal {
@@ -622,24 +780,29 @@ impl PolymarketHttpExecutionClient {
         signal: &StrategySignal,
         action: crate::types::OrderIntent,
     ) -> Result<ActionExecutionResult, ExecutionError> {
-        let payload = self.action_to_request(signal, &action);
-        let ts = chrono::Utc::now().timestamp_millis().to_string();
+        let payload = self.action_to_request(signal, &action)?;
+        let ts = chrono::Utc::now().timestamp().to_string();
         let nonce = self.next_nonce();
         let body = serde_json::to_string(&payload)
             .map_err(|e| ExecutionError::Backend(format!("failed to serialize order body: {e}")))?;
-        let path = "/orders".to_string();
+        let path = "/order".to_string();
         let method = "POST".to_string();
 
         let mut req = self
             .http
             .post(self.endpoint_url(path.as_str()))
             .header("content-type", "application/json")
-            .header("x-poly-timestamp", &ts)
-            .header("x-poly-nonce", &nonce)
             .json(&payload);
         if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
+            req = req.header("POLY_API_KEY", key);
         }
+        if let Some(passphrase) = &self.passphrase {
+            req = req.header("POLY_PASSPHRASE", passphrase);
+        }
+        if let Some(address) = &self.poly_address {
+            req = req.header("POLY_ADDRESS", address);
+        }
+        req = req.header("POLY_TIMESTAMP", &ts);
         if let Some(signature_type) = self.signature_type {
             req = req.header("x-poly-signature-type", signature_type.to_string());
         }
@@ -648,11 +811,11 @@ impl PolymarketHttpExecutionClient {
         }
         if let Some(signature_provider) = &self.signature_provider {
             let sign_ctx = OrderSignContext {
-                market_id: payload.market_id.clone(),
+                market_id: signal.market_id.clone(),
                 side: payload.side.clone(),
                 price: payload.price.clone(),
                 size: payload.size.clone(),
-                strategy_id: payload.strategy_id.clone(),
+                strategy_id: format!("{:?}", signal.strategy_id),
                 timestamp: ts.clone(),
                 nonce: nonce.clone(),
                 method: method.clone(),
@@ -660,7 +823,7 @@ impl PolymarketHttpExecutionClient {
                 body: body.clone(),
             };
             if let Some(signature) = signature_provider(&sign_ctx) {
-                req = req.header("x-poly-signature", signature);
+                req = req.header("POLY_SIGNATURE", signature);
             }
         }
 
@@ -728,7 +891,7 @@ impl PolymarketHttpExecutionClient {
             sleep(Duration::from_millis(self.status_poll_interval_ms)).await;
             let mut req = self
                 .http
-                .get(self.endpoint_url(&format!("orders/{order_id}")))
+                .get(self.endpoint_url(&format!("data/order/{order_id}")))
                 .header("content-type", "application/json");
             if let Some(key) = &self.api_key {
                 req = req.bearer_auth(key);
@@ -954,6 +1117,8 @@ mod tests {
         let signal = StrategySignal {
             strategy_id: StrategyId::Arbitrage,
             market_id: "m-event".to_string(),
+            yes_token_id: Some("1001".to_string()),
+            no_token_id: Some("1002".to_string()),
             actions: vec![
                 OrderIntent {
                     side: Side::Yes,
@@ -999,6 +1164,8 @@ mod tests {
         let signal = StrategySignal {
             strategy_id: StrategyId::Arbitrage,
             market_id: "m-err".to_string(),
+            yes_token_id: Some("1001".to_string()),
+            no_token_id: Some("1002".to_string()),
             actions: vec![OrderIntent {
                 side: Side::Yes,
                 price: Decimal::from_str("0.4").expect("invalid decimal"),

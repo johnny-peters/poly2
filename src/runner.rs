@@ -118,11 +118,9 @@ where
         if self.config.trade_cooldown_secs == 0 {
             return;
         }
-        let traded = matches!(
-            report.status,
-            ExecutionStatus::Filled | ExecutionStatus::PartiallyFilled
-        );
-        if traded && !report.fills.is_empty() {
+        let submitted = !matches!(report.status, ExecutionStatus::Rejected)
+            && !report.order_ids.is_empty();
+        if submitted {
             self.recently_traded
                 .insert(report.market_id.clone(), Instant::now());
         }
@@ -178,6 +176,8 @@ where
             let signal = StrategySignal {
                 strategy_id: StrategyId::PositionExit,
                 market_id: market_id.clone(),
+                yes_token_id: position.yes_token_id.clone(),
+                no_token_id: position.no_token_id.clone(),
                 actions,
                 state: StrategyState::Implemented,
             };

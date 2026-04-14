@@ -28,6 +28,8 @@ pub enum StrategyState {
 pub struct StrategySignal {
     pub strategy_id: crate::strategy::StrategyId,
     pub market_id: String,
+    pub yes_token_id: Option<String>,
+    pub no_token_id: Option<String>,
     pub actions: Vec<OrderIntent>,
     pub state: StrategyState,
 }
@@ -35,6 +37,8 @@ pub struct StrategySignal {
 #[derive(Clone, Debug)]
 pub struct MarketSnapshot {
     pub market_id: String,
+    pub yes_token_id: Option<String>,
+    pub no_token_id: Option<String>,
     pub yes_best_bid: Decimal,
     pub yes_best_ask: Decimal,
     pub no_best_bid: Decimal,
@@ -46,6 +50,8 @@ pub struct MarketSnapshot {
 #[derive(Clone, Debug)]
 pub struct Position {
     pub market_id: String,
+    pub yes_token_id: Option<String>,
+    pub no_token_id: Option<String>,
     pub qty_yes: Decimal,
     pub qty_no: Decimal,
     pub avg_entry_yes: Decimal,

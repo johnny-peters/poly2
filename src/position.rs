@@ -50,11 +50,20 @@ impl PositionManager {
             .entry(report.market_id.clone())
             .or_insert_with(|| Position {
                 market_id: report.market_id.clone(),
+                yes_token_id: report.signal.yes_token_id.clone(),
+                no_token_id: report.signal.no_token_id.clone(),
                 qty_yes: Decimal::ZERO,
                 qty_no: Decimal::ZERO,
                 avg_entry_yes: Decimal::ZERO,
                 avg_entry_no: Decimal::ZERO,
             });
+
+        if entry.yes_token_id.is_none() {
+            entry.yes_token_id = report.signal.yes_token_id.clone();
+        }
+        if entry.no_token_id.is_none() {
+            entry.no_token_id = report.signal.no_token_id.clone();
+        }
 
         for fill in &report.fills {
             if fill.sell {
