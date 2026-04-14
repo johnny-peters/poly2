@@ -2,10 +2,12 @@ use anyhow::{anyhow, Context};
 use chrono::Utc;
 use polymarket_client_sdk::auth::ExposeSecret as _;
 use polymarket_client_sdk::auth::{LocalSigner as PmLocalSigner, Signer as _};
-use polymarket_client_sdk::clob::types::Side as PmSide;
+use polymarket_client_sdk::clob::types::{Side as PmSide, SignatureType as PmSignatureType};
 use polymarket_client_sdk::clob::{Client as PmClobClient, Config as PmClobConfig};
-use polymarket_client_sdk::types::{Decimal as PmDecimal, U256 as PmU256};
-use polymarket_client_sdk::{POLYGON as PM_POLYGON, PRIVATE_KEY_VAR};
+use polymarket_client_sdk::types::{Address as PmAddress, Decimal as PmDecimal, U256 as PmU256};
+use polymarket_client_sdk::{
+    derive_proxy_wallet, derive_safe_wallet, POLYGON as PM_POLYGON, PRIVATE_KEY_VAR,
+};
 use rust_decimal::Decimal;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -133,8 +135,10 @@ async fn main() -> anyhow::Result<()> {
     let fetch_interval_secs = read_fetch_interval_secs(Path::new("src/.env"), 60);
     let scan_max_sum = read_scan_max_sum(Path::new("src/.env"), Decimal::from_str("1.005")?);
     let scan_min_edge = read_scan_min_edge(Path::new("src/.env"), Decimal::from_str("0.005")?);
+    let scan_top_n = read_scan_top_n(Path::new("src/.env"), 5);
     let scan_settle_guard_minutes = execution_settings.scan_min_minutes_to_settle;
     println!("market scan interval={}s (from FETCH_INTERVAL)", fetch_interval_secs);
+    println!("market scan top_n={} (from SCAN_TOP_N)", scan_top_n);
     println!("market scan max_sum={} (from SCAN_MAX_SUM)", scan_max_sum);
     println!("market scan min_edge={} (from SCAN_MIN_EDGE)", scan_min_edge);
     println!(
@@ -156,6 +160,9 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(http_url) = &execution_settings.polymarket_http_url {
         println!("execution mode=HTTP live, target={http_url}");
+        let pm_chain_id = read_pm_chain_id(dotenv_path, PM_POLYGON);
+        let pm_signature_type = resolve_pm_signature_type(dotenv_path)?;
+        let pm_funder = resolve_pm_funder_address(dotenv_path, pm_signature_type, pm_chain_id)?;
         let mut client = if let Some(env_key) = &execution_settings.api_key_env {
             PolymarketHttpExecutionClient::new(http_url.clone()).with_api_key_env(env_key)
         } else {
@@ -171,6 +178,14 @@ async fn main() -> anyhow::Result<()> {
         );
         if let Some(signature_env) = &execution_settings.signature_env {
             client = client.with_dynamic_hmac_signature_env(signature_env);
+        }
+        if let Some(sig) = pm_signature_type {
+            println!("pm_signature_type={}", pm_signature_type_to_name(sig));
+            client = client.with_signature_type(sig as u8);
+        }
+        if let Some(funder) = pm_funder {
+            println!("pm_funder={funder}");
+            client = client.with_funder(funder.to_string());
         }
         let retrying = RetryingExecutionClient::new(
             client,
@@ -198,7 +213,7 @@ async fn main() -> anyhow::Result<()> {
         run_live_market_loop(
             &execution_settings,
             fetch_interval_secs,
-            1000,
+            scan_top_n,
             scan_max_sum,
             scan_min_edge,
             scan_settle_guard_minutes,
@@ -226,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
         run_live_market_loop(
             &execution_settings,
             fetch_interval_secs,
-            20,
+            scan_top_n,
             scan_max_sum,
             scan_min_edge,
             scan_settle_guard_minutes,
@@ -316,14 +331,34 @@ async fn run_sdk_limit_order(dotenv_path: &Path) -> anyhow::Result<()> {
     let signer = PmLocalSigner::from_str(private_key.trim())
         .context("invalid private key format")?
         .with_chain_id(Some(chain_id));
-    let client = PmClobClient::new(&host, PmClobConfig::default())?
-        .authentication_builder(&signer)
-        .authenticate()
-        .await?;
+    let pm_signature_type = resolve_pm_signature_type(dotenv_path)?;
+    let pm_funder = resolve_pm_funder_address(dotenv_path, pm_signature_type, chain_id)?;
+    let pm_funder_display = pm_funder
+        .as_ref()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "(auto)".to_string());
+    let mut auth_builder = PmClobClient::new(&host, PmClobConfig::default())?
+        .authentication_builder(&signer);
+    if let Some(sig) = pm_signature_type {
+        auth_builder = auth_builder.signature_type(sig);
+    }
+    if let Some(funder) = pm_funder {
+        auth_builder = auth_builder.funder(funder);
+    }
+    let client = auth_builder.authenticate().await?;
 
     println!(
-        "sdk-order: host={}, chain_id={}, token_id={}, side={:?}, price={}, size={}",
-        host, chain_id, token_id, side, price, size
+        "sdk-order: host={}, chain_id={}, token_id={}, side={:?}, price={}, size={}, pm_signature_type={}, pm_funder={}",
+        host,
+        chain_id,
+        token_id,
+        side,
+        price,
+        size,
+        pm_signature_type
+            .map(pm_signature_type_to_name)
+            .unwrap_or("eoa"),
+        pm_funder_display
     );
 
     let order = client
@@ -720,6 +755,28 @@ fn read_scan_min_edge(dotenv_path: &Path, default_min_edge: Decimal) -> Decimal 
     default_min_edge
 }
 
+fn read_scan_top_n(dotenv_path: &Path, default_top_n: usize) -> usize {
+    let Ok(raw) = std::fs::read_to_string(dotenv_path) else {
+        return default_top_n.max(1);
+    };
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if k.trim() != "SCAN_TOP_N" {
+            continue;
+        }
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n.max(1);
+        }
+    }
+    default_top_n.max(1)
+}
+
 fn read_trade_cooldown_secs(dotenv_path: &Path, default_secs: u64) -> u64 {
     let Ok(raw) = std::fs::read_to_string(dotenv_path) else {
         return default_secs;
@@ -1075,6 +1132,85 @@ fn parse_pm_side(raw: &str) -> Option<PmSide> {
         "sell" | "ask" | "s" => Some(PmSide::Sell),
         _ => None,
     }
+}
+
+fn read_pm_chain_id(dotenv_path: &Path, default_chain_id: u64) -> u64 {
+    resolve_runtime_var("PM_CHAIN_ID", dotenv_path)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default_chain_id)
+}
+
+fn resolve_pm_signature_type(dotenv_path: &Path) -> anyhow::Result<Option<PmSignatureType>> {
+    let Some(raw) = resolve_runtime_var("PM_SIGNATURE_TYPE", dotenv_path) else {
+        return Ok(None);
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    let value = match normalized.as_str() {
+        "" => return Ok(None),
+        "0" | "eoa" => PmSignatureType::Eoa,
+        "1" | "proxy" => PmSignatureType::Proxy,
+        "2" | "gnosis_safe" | "gnosissafe" | "safe" => PmSignatureType::GnosisSafe,
+        _ => {
+            return Err(anyhow!(
+                "invalid PM_SIGNATURE_TYPE='{}' (supported: eoa|proxy|gnosis_safe or 0|1|2)",
+                raw.trim()
+            ));
+        }
+    };
+    Ok(Some(value))
+}
+
+fn pm_signature_type_to_name(signature_type: PmSignatureType) -> &'static str {
+    match signature_type {
+        PmSignatureType::Eoa => "eoa",
+        PmSignatureType::Proxy => "proxy",
+        PmSignatureType::GnosisSafe => "gnosis_safe",
+        _ => "unknown",
+    }
+}
+
+fn resolve_pm_funder_address(
+    dotenv_path: &Path,
+    signature_type: Option<PmSignatureType>,
+    chain_id: u64,
+) -> anyhow::Result<Option<PmAddress>> {
+    if let Some(raw) = resolve_runtime_var("PM_FUNDER", dotenv_path) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let parsed = PmAddress::from_str(trimmed)
+                .with_context(|| format!("invalid PM_FUNDER address: {trimmed}"))?;
+            return Ok(Some(parsed));
+        }
+    }
+    let derived = match signature_type {
+        Some(PmSignatureType::Proxy) => derive_pm_funder_from_private_key(dotenv_path, chain_id, true)?,
+        Some(PmSignatureType::GnosisSafe) => {
+            derive_pm_funder_from_private_key(dotenv_path, chain_id, false)?
+        }
+        _ => None,
+    };
+    Ok(derived)
+}
+
+fn derive_pm_funder_from_private_key(
+    dotenv_path: &Path,
+    chain_id: u64,
+    is_proxy: bool,
+) -> anyhow::Result<Option<PmAddress>> {
+    let Some(private_key) = resolve_runtime_var(PRIVATE_KEY_VAR, dotenv_path)
+        .or_else(|| resolve_runtime_var("PRIVATE_KEY", dotenv_path))
+    else {
+        return Ok(None);
+    };
+    let signer = PmLocalSigner::from_str(private_key.trim())
+        .context("invalid private key format for PM_FUNDER derivation")?
+        .with_chain_id(Some(chain_id));
+    let derived = if is_proxy {
+        derive_proxy_wallet(signer.address(), chain_id)
+    } else {
+        derive_safe_wallet(signer.address(), chain_id)
+    };
+    Ok(derived)
 }
 
 fn read_decimal_var(dotenv_path: &Path, key: &str) -> Option<Decimal> {

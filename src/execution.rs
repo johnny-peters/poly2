@@ -297,6 +297,8 @@ pub struct PolymarketHttpExecutionClient {
     http: reqwest::Client,
     api_base_url: String,
     api_key: Option<String>,
+    funder: Option<String>,
+    signature_type: Option<u8>,
     per_order_max_retries: u32,
     per_order_backoff_ms: u64,
     status_poll_attempts: u32,
@@ -397,6 +399,8 @@ impl PolymarketHttpExecutionClient {
             http: reqwest::Client::new(),
             api_base_url: api_base_url.into(),
             api_key: None,
+            funder: None,
+            signature_type: None,
             per_order_max_retries: 0,
             per_order_backoff_ms: 50,
             status_poll_attempts: 3,
@@ -408,6 +412,19 @@ impl PolymarketHttpExecutionClient {
 
     pub fn with_api_key_env(mut self, env_key: &str) -> Self {
         self.api_key = env::var(env_key).ok();
+        self
+    }
+
+    pub fn with_funder(mut self, funder: impl Into<String>) -> Self {
+        let funder = funder.into().trim().to_string();
+        if !funder.is_empty() {
+            self.funder = Some(funder);
+        }
+        self
+    }
+
+    pub fn with_signature_type(mut self, signature_type: u8) -> Self {
+        self.signature_type = Some(signature_type);
         self
     }
 
@@ -622,6 +639,12 @@ impl PolymarketHttpExecutionClient {
             .json(&payload);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
+        }
+        if let Some(signature_type) = self.signature_type {
+            req = req.header("x-poly-signature-type", signature_type.to_string());
+        }
+        if let Some(funder) = &self.funder {
+            req = req.header("x-poly-funder", funder);
         }
         if let Some(signature_provider) = &self.signature_provider {
             let sign_ctx = OrderSignContext {

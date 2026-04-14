@@ -92,6 +92,8 @@ cargo run -- scan-arb
 - `NETWORK_RETRY_LIMIT` 或 `RETRY_LIMIT` -> 覆盖 `execution.max_retries`
 - `REQUEST_TIMEOUT_MS` -> 覆盖 `execution.timeout_secs`
 - `STATUS_POLL_INTERVAL_MS` -> 覆盖 `execution.status_poll_interval_ms`
+- `PM_SIGNATURE_TYPE` -> Polymarket 账户签名模式（`eoa|proxy|gnosis_safe` 或 `0|1|2`）
+- `PM_FUNDER` -> 可选，指定 Polymarket 资金地址（不填时在 `proxy/gnosis_safe` 模式下会按私钥自动推导）
 - `SCAN_MIN_MINUTES_TO_SETTLE` -> 扫描时过滤“距离结算不足 N 分钟”的市场（默认 30）
 - `TRADING_ENABLED` -> `false` 时仅扫描不下单（支持 `true/false/1/0/on/off`）
 - `TOTAL_CAPITAL_USD` -> 风控总资金（优先用于实盘）
@@ -143,6 +145,19 @@ cargo run -- scan-arb
 
 ```bash
 cargo run --example event_stream
+```
+
+## 盈利验证文档
+
+- `docs/profitability-feasibility.md`：盈利可行性审查（证据基线、净收益口径、Go/No-Go 标准）
+- `docs/pilot-14d-checklist.md`：14 天小额实盘验证清单
+- `docs/templates/daily-profit-report.csv`：日级收益记录模板
+- `scripts/generate_daily_profit_report.py`：从 `ORDER_LOG_PATH` + `POSITIONS_PATH` 半自动生成/更新日报
+
+日报脚本默认可无参运行（默认读取 `data/orders.jsonl`、`data/positions.json`、`start_capital=100`）：
+
+```bash
+python scripts/generate_daily_profit_report.py
 ```
 
 ## 常见问题

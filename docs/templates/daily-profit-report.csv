@@ -1,0 +1,2 @@
+date,start_capital,gross_pnl,fees,slippage_cost,failure_cost,net_pnl,daily_net_return,max_drawdown_to_date,report_count,filled_or_partial_count,notes
+2026-04-14,100.00,0.62,0.11,0.08,0.03,0.40,0.0040,0.0000,18,15,"sample row"

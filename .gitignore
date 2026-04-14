@@ -1,12 +1,15 @@
 # Rust build output
 /target/
 /target_tmp/
+/.tools/
 
 # Environment and secrets (NEVER commit these!)
 .env
 .env.*
 *.env
 src/.env
+data/daily-profit-report.csv
+data/daily-report-state.json
 
 # IDE
 .idea/
