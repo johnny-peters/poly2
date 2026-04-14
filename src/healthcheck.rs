@@ -5,7 +5,7 @@ use reqwest::Url;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -198,6 +198,75 @@ pub async fn scan_arb_candidates(
         out.len()
     );
     Ok(out)
+}
+
+/// Force-poll executable quotes for specific market ids (used by exit checks on held positions).
+pub async fn fetch_market_snapshots_by_ids(
+    execution: &ExecutionSettings,
+    market_ids: &[String],
+) -> Result<Vec<crate::types::MarketSnapshot>> {
+    if market_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let request_timeout = Duration::from_secs(execution.timeout_secs.max(1));
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(request_timeout)
+        .build()
+        .context("failed to build http client")?;
+    let base = scan_markets_base_url(execution);
+    let url = format!(
+        "{}/markets?limit=1000&closed=false&archived=false",
+        base.trim_end_matches('/')
+    );
+    let resp = http.get(&url).send().await.context("markets request failed")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("markets request failed with status {}", resp.status()));
+    }
+    let root: Value = resp.json().await.context("failed to parse markets json")?;
+    let data = if let Some(arr) = root.as_array() {
+        arr
+    } else {
+        root.get("data")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow!("missing data array in markets response"))?
+    };
+
+    let clob_base = "https://clob.polymarket.com";
+    let target_ids: HashSet<String> = market_ids.iter().cloned().collect();
+    let mut found_ids: HashSet<String> = HashSet::new();
+    let mut snapshots = Vec::new();
+
+    for market in data {
+        let market_id = extract_stable_market_id(market);
+        if !target_ids.contains(&market_id) || found_ids.contains(&market_id) {
+            continue;
+        }
+        let Some((token_a, token_b)) = extract_clob_token_ids(market) else {
+            continue;
+        };
+        let Some((price_a, bid_a, price_b, bid_b)) =
+            fetch_executable_quotes(&http, clob_base, &token_a, &token_b).await
+        else {
+            continue;
+        };
+        snapshots.push(crate::types::MarketSnapshot {
+            market_id: market_id.clone(),
+            yes_best_bid: bid_a,
+            yes_best_ask: price_a,
+            no_best_bid: bid_b,
+            no_best_ask: price_b,
+            volume_24h: extract_volume_24h(market),
+            timestamp: Utc::now(),
+        });
+        found_ids.insert(market_id);
+        if found_ids.len() >= target_ids.len() {
+            break;
+        }
+    }
+
+    Ok(snapshots)
 }
 
 enum MarketScanOutcome {

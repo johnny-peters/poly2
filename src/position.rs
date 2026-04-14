@@ -133,6 +133,20 @@ impl PositionManager {
         &self.positions
     }
 
+    /// Return market ids that still have open quantity on either side.
+    pub fn open_market_ids(&self) -> Vec<String> {
+        self.positions
+            .iter()
+            .filter_map(|(market_id, p)| {
+                if p.qty_yes > Decimal::ZERO || p.qty_no > Decimal::ZERO {
+                    Some(market_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub fn realized_notional(&self) -> Decimal {
         self.realized_notional
     }

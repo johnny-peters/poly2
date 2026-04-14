@@ -15,11 +15,11 @@ use std::sync::Arc;
 use tokio::time::{self, Duration};
 
 use poly2::{
-    append_order_record, load_positions, run_healthcheck, save_positions, scan_arb_candidates,
-    AppConfig, ArbitrageStrategy, EngineRunner, ExecutionClient, ExecutionReport, ExecutionSettings,
-    MarketSnapshot, MockExecutionClient, PolymarketHttpExecutionClient, RetryingExecutionClient,
-    RiskContext, RiskEngine, StrategyContext, StrategyId, StrategyRegistry, TodoStrategy,
-    TradingEngine,
+    append_order_record, fetch_market_snapshots_by_ids, load_positions, run_healthcheck,
+    save_positions, scan_arb_candidates, AppConfig, ArbitrageStrategy, EngineRunner,
+    ExecutionClient, ExecutionReport, ExecutionSettings, MarketSnapshot, MockExecutionClient,
+    PolymarketHttpExecutionClient, RetryingExecutionClient, RiskContext, RiskEngine,
+    StrategyContext, StrategyId, StrategyRegistry, TodoStrategy, TradingEngine,
 };
 
 #[tokio::main]
@@ -528,11 +528,75 @@ async fn run_live_market_loop<C>(
                                 "tracked_markets={}",
                                 runner.position_manager().positions().len()
                             );
+                            let mut forced_exit_error = false;
+                            let open_market_ids = runner.position_manager().open_market_ids();
+                            if !open_market_ids.is_empty() {
+                                match fetch_market_snapshots_by_ids(execution_settings, &open_market_ids).await {
+                                    Ok(forced_snapshots) => {
+                                        if !forced_snapshots.is_empty() {
+                                            println!(
+                                                "forced_quote_poll: held_markets={}, quoted_markets={}",
+                                                open_market_ids.len(),
+                                                forced_snapshots.len()
+                                            );
+                                            let forced_marks: HashMap<String, (Decimal, Decimal, Decimal, Decimal)> =
+                                                forced_snapshots
+                                                    .iter()
+                                                    .map(|s| {
+                                                        (
+                                                            s.market_id.clone(),
+                                                            (
+                                                                s.yes_best_bid,
+                                                                s.yes_best_ask,
+                                                                s.no_best_bid,
+                                                                s.no_best_ask,
+                                                            ),
+                                                        )
+                                                    })
+                                                    .collect();
+                                            match runner
+                                                .run_forced_exit_checks_with_report_hook(&forced_marks, |report| {
+                                                    print_execution_report(report);
+                                                    if let Some(path) = order_log_path {
+                                                        let _ = append_order_record(path, report);
+                                                    }
+                                                })
+                                                .await
+                                            {
+                                                Ok(forced_exit_reports) => {
+                                                    if forced_exit_reports > 0 {
+                                                        println!(
+                                                            "forced_exit_reports={} (held-market quote poll)",
+                                                            forced_exit_reports
+                                                        );
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    eprintln!("forced exit checks failed: {err}");
+                                                    forced_exit_error = true;
+                                                }
+                                            }
+                                        } else {
+                                            println!(
+                                                "forced_quote_poll: held_markets={} but no executable quotes found",
+                                                open_market_ids.len()
+                                            );
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!("forced quote poll failed: {err}");
+                                    }
+                                }
+                            }
                             if let Err(e) = save_positions(positions_path, runner.position_manager()) {
                                 eprintln!("persist positions failed: {}", e);
                                 loop_outcome = LoopOutcome::Failure;
                             } else {
-                                loop_outcome = LoopOutcome::Success;
+                                loop_outcome = if forced_exit_error {
+                                    LoopOutcome::Failure
+                                } else {
+                                    LoopOutcome::Success
+                                };
                             }
                         }
                         Err(err) => {

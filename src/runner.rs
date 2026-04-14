@@ -187,6 +187,24 @@ where
         Ok(reports)
     }
 
+    /// Run take-profit / stop-loss checks against provided marks and emit reports.
+    pub async fn run_forced_exit_checks_with_report_hook<F>(
+        &mut self,
+        marks: &HashMap<String, MarkQuad>,
+        mut on_report: F,
+    ) -> Result<usize, EngineError>
+    where
+        F: FnMut(&ExecutionReport),
+    {
+        let reports = self.run_exit_checks(marks).await?;
+        for report in &reports {
+            on_report(report);
+            self.record_traded(report);
+            self.position_manager.apply_report(report);
+        }
+        Ok(reports.len())
+    }
+
     fn marks_for_pnl(marks: &HashMap<String, MarkQuad>) -> HashMap<String, (Decimal, Decimal)> {
         marks
             .iter()
@@ -293,13 +311,11 @@ where
             summary.execution_reports += reports.len();
         }
 
-        if let Ok(exit_reports) = self.run_exit_checks(&latest_marks).await {
-            for report in &exit_reports {
-                on_report(report);
-                self.record_traded(report);
-                self.position_manager.apply_report(report);
-            }
-            summary.execution_reports += exit_reports.len();
+        if let Ok(exit_report_count) = self
+            .run_forced_exit_checks_with_report_hook(&latest_marks, |report| on_report(report))
+            .await
+        {
+            summary.execution_reports += exit_report_count;
         }
 
         let pnl = self.position_manager.pnl_snapshot(&Self::marks_for_pnl(&latest_marks));
