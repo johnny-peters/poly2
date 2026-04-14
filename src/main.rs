@@ -1,5 +1,11 @@
 use anyhow::{anyhow, Context};
 use chrono::Utc;
+use polymarket_client_sdk::auth::ExposeSecret as _;
+use polymarket_client_sdk::auth::{LocalSigner as PmLocalSigner, Signer as _};
+use polymarket_client_sdk::clob::types::Side as PmSide;
+use polymarket_client_sdk::clob::{Client as PmClobClient, Config as PmClobConfig};
+use polymarket_client_sdk::types::{Decimal as PmDecimal, U256 as PmU256};
+use polymarket_client_sdk::{POLYGON as PM_POLYGON, PRIVATE_KEY_VAR};
 use rust_decimal::Decimal;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -93,6 +99,18 @@ async fn main() -> anyhow::Result<()> {
         .await;
         return Ok(());
     }
+    if args.get(1).map(|s| s.as_str()) == Some("sdk-order") {
+        run_sdk_limit_order(dotenv_path).await?;
+        return Ok(());
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("sdk-auth-check") {
+        run_sdk_auth_check(dotenv_path).await?;
+        return Ok(());
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("sdk-auth-export") {
+        run_sdk_auth_export(dotenv_path).await?;
+        return Ok(());
+    }
     let mut registry = StrategyRegistry::new();
     if app_config.strategies.arbitrage.enabled {
         registry.register(Arc::new(ArbitrageStrategy::new(app_config.arbitrage_config()?)));
@@ -152,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
             execution_settings.status_poll_interval_ms,
         );
         if let Some(signature_env) = &execution_settings.signature_env {
-            client = client.with_static_signature_env(signature_env);
+            client = client.with_dynamic_hmac_signature_env(signature_env);
         }
         let retrying = RetryingExecutionClient::new(
             client,
@@ -267,6 +285,130 @@ async fn run_scan_arb_once(
             eprintln!("scan-arb failed: {err}");
         }
     }
+}
+
+async fn run_sdk_limit_order(dotenv_path: &Path) -> anyhow::Result<()> {
+    let host = resolve_runtime_var("PM_HOST", dotenv_path)
+        .unwrap_or_else(|| "https://clob.polymarket.com".to_string());
+    let chain_id = resolve_runtime_var("PM_CHAIN_ID", dotenv_path)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(PM_POLYGON);
+    let private_key = resolve_runtime_var(PRIVATE_KEY_VAR, dotenv_path)
+        .or_else(|| resolve_runtime_var("PRIVATE_KEY", dotenv_path))
+        .ok_or_else(|| anyhow!("missing private key: set {PRIVATE_KEY_VAR} or PRIVATE_KEY"))?;
+    let token_id_raw = resolve_runtime_var("PM_TOKEN_ID", dotenv_path)
+        .ok_or_else(|| anyhow!("missing PM_TOKEN_ID in env/.env"))?;
+    let price_raw = resolve_runtime_var("PM_ORDER_PRICE", dotenv_path)
+        .unwrap_or_else(|| "0.50".to_string());
+    let size_raw = resolve_runtime_var("PM_ORDER_SIZE", dotenv_path)
+        .unwrap_or_else(|| "10".to_string());
+    let side_raw = resolve_runtime_var("PM_ORDER_SIDE", dotenv_path)
+        .unwrap_or_else(|| "buy".to_string());
+
+    let token_id = PmU256::from_str(token_id_raw.trim())
+        .with_context(|| format!("invalid PM_TOKEN_ID: {}", token_id_raw.trim()))?;
+    let price = PmDecimal::from_str(price_raw.trim())
+        .with_context(|| format!("invalid PM_ORDER_PRICE: {}", price_raw.trim()))?;
+    let size = PmDecimal::from_str(size_raw.trim())
+        .with_context(|| format!("invalid PM_ORDER_SIZE: {}", size_raw.trim()))?;
+    let side = parse_pm_side(side_raw.trim())
+        .ok_or_else(|| anyhow!("invalid PM_ORDER_SIDE: {} (expected buy/sell)", side_raw.trim()))?;
+    let signer = PmLocalSigner::from_str(private_key.trim())
+        .context("invalid private key format")?
+        .with_chain_id(Some(chain_id));
+    let client = PmClobClient::new(&host, PmClobConfig::default())?
+        .authentication_builder(&signer)
+        .authenticate()
+        .await?;
+
+    println!(
+        "sdk-order: host={}, chain_id={}, token_id={}, side={:?}, price={}, size={}",
+        host, chain_id, token_id, side, price, size
+    );
+
+    let order = client
+        .limit_order()
+        .token_id(token_id)
+        .price(price)
+        .size(size)
+        .side(side)
+        .build()
+        .await?;
+    let signed_order = client.sign(&signer, order).await?;
+    let response = client.post_order(signed_order).await?;
+
+    println!("sdk-order: order_id={}", response.order_id);
+    println!(
+        "sdk-order: status={:?}, success={}, error_msg={:?}",
+        response.status, response.success, response.error_msg
+    );
+
+    Ok(())
+}
+
+async fn run_sdk_auth_check(dotenv_path: &Path) -> anyhow::Result<()> {
+    let host = resolve_runtime_var("PM_HOST", dotenv_path)
+        .unwrap_or_else(|| "https://clob.polymarket.com".to_string());
+    let chain_id = resolve_runtime_var("PM_CHAIN_ID", dotenv_path)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(PM_POLYGON);
+    let private_key = resolve_runtime_var(PRIVATE_KEY_VAR, dotenv_path)
+        .or_else(|| resolve_runtime_var("PRIVATE_KEY", dotenv_path))
+        .ok_or_else(|| anyhow!("missing private key: set {PRIVATE_KEY_VAR} or PRIVATE_KEY"))?;
+
+    let signer = PmLocalSigner::from_str(private_key.trim())
+        .context("invalid private key format")?
+        .with_chain_id(Some(chain_id));
+    let client = PmClobClient::new(&host, PmClobConfig::default())?;
+    let credentials = client.create_or_derive_api_key(&signer, None).await?;
+    let derived_key = credentials.key().to_string();
+    let configured_key = resolve_runtime_var("POLYMARKET_API_KEY", dotenv_path)
+        .or_else(|| resolve_runtime_var("API_KEY", dotenv_path));
+
+    println!("sdk-auth-check: host={host}, chain_id={chain_id}");
+    println!("sdk-auth-check: derived_api_key={derived_key}");
+    if let Some(configured) = configured_key {
+        let matches = configured.trim().eq_ignore_ascii_case(derived_key.as_str());
+        println!("sdk-auth-check: configured_api_key={}", configured.trim());
+        println!("sdk-auth-check: api_key_match={matches}");
+        if !matches {
+            return Err(anyhow!(
+                "configured POLYMARKET_API_KEY does not match sdk-derived key"
+            ));
+        }
+    } else {
+        println!("sdk-auth-check: configured_api_key=(missing)");
+    }
+    Ok(())
+}
+
+async fn run_sdk_auth_export(dotenv_path: &Path) -> anyhow::Result<()> {
+    let host = resolve_runtime_var("PM_HOST", dotenv_path)
+        .unwrap_or_else(|| "https://clob.polymarket.com".to_string());
+    let chain_id = resolve_runtime_var("PM_CHAIN_ID", dotenv_path)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(PM_POLYGON);
+    let private_key = resolve_runtime_var(PRIVATE_KEY_VAR, dotenv_path)
+        .or_else(|| resolve_runtime_var("PRIVATE_KEY", dotenv_path))
+        .ok_or_else(|| anyhow!("missing private key: set {PRIVATE_KEY_VAR} or PRIVATE_KEY"))?;
+
+    let signer = PmLocalSigner::from_str(private_key.trim())
+        .context("invalid private key format")?
+        .with_chain_id(Some(chain_id));
+    let client = PmClobClient::new(&host, PmClobConfig::default())?;
+    let credentials = client.create_or_derive_api_key(&signer, None).await?;
+
+    println!("# copy to src/.env");
+    println!("POLYMARKET_API_KEY='{}'", credentials.key());
+    println!(
+        "POLYMARKET_SIGNATURE='{}'",
+        credentials.secret().expose_secret()
+    );
+    println!(
+        "POLYMARKET_PASSPHRASE='{}'",
+        credentials.passphrase().expose_secret()
+    );
+    Ok(())
 }
 
 async fn run_live_market_loop<C>(
@@ -859,6 +1001,14 @@ fn parse_bool_flag(raw: &str) -> Option<bool> {
     match raw.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_pm_side(raw: &str) -> Option<PmSide> {
+    match raw.to_ascii_lowercase().as_str() {
+        "buy" | "bid" | "b" => Some(PmSide::Buy),
+        "sell" | "ask" | "s" => Some(PmSide::Sell),
         _ => None,
     }
 }

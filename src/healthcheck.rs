@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use futures::stream::{self, StreamExt};
 use reqwest::Url;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -92,14 +93,20 @@ pub async fn scan_arb_candidates(
     settle_guard_minutes: u64,
 ) -> Result<Vec<ArbCandidate>> {
     const LATEST_WINDOW: usize = 200;
+    const PRICE_SCAN_CONCURRENCY: usize = 24;
     let clob_base = "https://clob.polymarket.com";
-    let http = reqwest::Client::new();
+    let request_timeout = Duration::from_secs(execution.timeout_secs.max(1));
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(request_timeout)
+        .build()
+        .context("failed to build http client")?;
     let base = scan_markets_base_url(execution);
     let url = format!(
         "{}/markets?limit=1000&closed=false&archived=false",
         base.trim_end_matches('/')
     );
-    let resp = reqwest::get(&url).await.context("markets request failed")?;
+    let resp = http.get(&url).send().await.context("markets request failed")?;
     if !resp.status().is_success() {
         return Err(anyhow!("markets request failed with status {}", resp.status()));
     }
@@ -136,52 +143,39 @@ pub async fn scan_arb_candidates(
 
     let mut out = Vec::new();
     let active_open_count = active_open.len();
-    let mut price_parsed_count = 0usize;
+    let mut token_ids_ok_count = 0usize;
     let mut clob_price_ok_count = 0usize;
     let mut under_sum_count = 0usize;
     let mut edge_pass_count = 0usize;
-    for m in window {
-        let Some((token_a, token_b)) = extract_clob_token_ids(m) else {
-            continue;
-        };
-        price_parsed_count += 1;
-        let Some((price_a, bid_a, price_b, bid_b)) =
-            fetch_executable_quotes(&http, clob_base, &token_a, &token_b).await
-        else {
-            continue;
-        };
-        clob_price_ok_count += 1;
-        let sum = price_a + price_b;
-        if sum >= max_sum {
-            continue;
+    let mut outcomes = stream::iter(window.iter().cloned().map(|market| {
+        let http = http.clone();
+        async move { evaluate_market_for_arb(&http, clob_base, market, max_sum, min_edge).await }
+    }))
+    .buffer_unordered(PRICE_SCAN_CONCURRENCY);
+
+    while let Some(outcome) = outcomes.next().await {
+        match outcome {
+            MarketScanOutcome::MissingTokenIds => {}
+            MarketScanOutcome::TokenIdsResolved => {
+                token_ids_ok_count += 1;
+            }
+            MarketScanOutcome::PriceOkButNotArb => {
+                token_ids_ok_count += 1;
+                clob_price_ok_count += 1;
+            }
+            MarketScanOutcome::UnderSumOnly => {
+                token_ids_ok_count += 1;
+                clob_price_ok_count += 1;
+                under_sum_count += 1;
+            }
+            MarketScanOutcome::Candidate(candidate) => {
+                token_ids_ok_count += 1;
+                clob_price_ok_count += 1;
+                under_sum_count += 1;
+                edge_pass_count += 1;
+                out.push(candidate);
+            }
         }
-        under_sum_count += 1;
-        let edge = Decimal::ONE - sum;
-        if edge < min_edge {
-            continue;
-        }
-        edge_pass_count += 1;
-        let candidate = ArbCandidate {
-            market_id: extract_stable_market_id(m),
-            question: m
-                .get("question")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            market_slug: m
-                .get("market_slug")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            bid_a,
-            price_a,
-            bid_b,
-            price_b,
-            volume_24h: extract_volume_24h(m),
-            sum,
-            edge,
-        };
-        out.push(candidate);
     }
 
     out.sort_by(|a, b| b.edge.cmp(&a.edge));
@@ -195,7 +189,7 @@ pub async fn scan_arb_candidates(
         filtered_near_settlement,
         active_open_count,
         window.len(),
-        price_parsed_count,
+        token_ids_ok_count,
         clob_price_ok_count,
         under_sum_count,
         edge_pass_count,
@@ -204,6 +198,63 @@ pub async fn scan_arb_candidates(
         out.len()
     );
     Ok(out)
+}
+
+enum MarketScanOutcome {
+    MissingTokenIds,
+    TokenIdsResolved,
+    PriceOkButNotArb,
+    UnderSumOnly,
+    Candidate(ArbCandidate),
+}
+
+async fn evaluate_market_for_arb(
+    http: &reqwest::Client,
+    clob_base: &str,
+    market: &Value,
+    max_sum: Decimal,
+    min_edge: Decimal,
+) -> MarketScanOutcome {
+    let Some((token_a, token_b)) = extract_clob_token_ids(market) else {
+        return MarketScanOutcome::MissingTokenIds;
+    };
+
+    let Some((price_a, bid_a, price_b, bid_b)) =
+        fetch_executable_quotes(http, clob_base, &token_a, &token_b).await
+    else {
+        return MarketScanOutcome::TokenIdsResolved;
+    };
+
+    let sum = price_a + price_b;
+    if sum >= max_sum {
+        return MarketScanOutcome::PriceOkButNotArb;
+    }
+
+    let edge = Decimal::ONE - sum;
+    if edge < min_edge {
+        return MarketScanOutcome::UnderSumOnly;
+    }
+
+    MarketScanOutcome::Candidate(ArbCandidate {
+        market_id: extract_stable_market_id(market),
+        question: market
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        market_slug: market
+            .get("market_slug")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        bid_a,
+        price_a,
+        bid_b,
+        price_b,
+        volume_24h: extract_volume_24h(market),
+        sum,
+        edge,
+    })
 }
 
 fn bool_by_keys(market: &Value, keys: &[&str]) -> Option<bool> {

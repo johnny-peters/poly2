@@ -1,8 +1,12 @@
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE;
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
+use hmac::{Hmac, KeyInit, Mac as _};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::HashSet;
 use std::env;
 use std::str::FromStr;
@@ -313,6 +317,9 @@ pub struct OrderSignContext {
     pub strategy_id: String,
     pub timestamp: String,
     pub nonce: String,
+    pub method: String,
+    pub path: String,
+    pub body: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -431,6 +438,34 @@ impl PolymarketHttpExecutionClient {
     pub fn with_static_signature_env(mut self, env_key: &str) -> Self {
         if let Ok(signature) = env::var(env_key) {
             self.signature_provider = Some(Arc::new(move |_ctx| Some(signature.clone())));
+        }
+        self
+    }
+
+    /// Loads a base64-url encoded CLOB secret from env and signs each request body dynamically.
+    /// If decoding fails, falls back to the raw env value to preserve legacy static-signature behavior.
+    pub fn with_dynamic_hmac_signature_env(mut self, env_key: &str) -> Self {
+        let Ok(raw_value) = env::var(env_key) else {
+            return self;
+        };
+        let trimmed = raw_value.trim().to_string();
+        if trimmed.is_empty() {
+            return self;
+        }
+
+        match URL_SAFE.decode(trimmed.as_bytes()) {
+            Ok(decoded_secret) => {
+                self.signature_provider = Some(Arc::new(move |ctx| {
+                    let message = format!("{}{}{}{}", ctx.timestamp, ctx.method, ctx.path, ctx.body);
+                    let mut mac = Hmac::<Sha256>::new_from_slice(&decoded_secret).ok()?;
+                    mac.update(message.as_bytes());
+                    let digest = mac.finalize().into_bytes();
+                    Some(URL_SAFE.encode(digest))
+                }));
+            }
+            Err(_) => {
+                self.signature_provider = Some(Arc::new(move |_ctx| Some(trimmed.clone())));
+            }
         }
         self
     }
@@ -573,10 +608,14 @@ impl PolymarketHttpExecutionClient {
         let payload = self.action_to_request(signal, &action);
         let ts = chrono::Utc::now().timestamp_millis().to_string();
         let nonce = self.next_nonce();
+        let body = serde_json::to_string(&payload)
+            .map_err(|e| ExecutionError::Backend(format!("failed to serialize order body: {e}")))?;
+        let path = "/orders".to_string();
+        let method = "POST".to_string();
 
         let mut req = self
             .http
-            .post(self.endpoint_url("orders"))
+            .post(self.endpoint_url(path.as_str()))
             .header("content-type", "application/json")
             .header("x-poly-timestamp", &ts)
             .header("x-poly-nonce", &nonce)
@@ -593,6 +632,9 @@ impl PolymarketHttpExecutionClient {
                 strategy_id: payload.strategy_id.clone(),
                 timestamp: ts.clone(),
                 nonce: nonce.clone(),
+                method: method.clone(),
+                path: path.clone(),
+                body: body.clone(),
             };
             if let Some(signature) = signature_provider(&sign_ctx) {
                 req = req.header("x-poly-signature", signature);
