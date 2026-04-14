@@ -35,9 +35,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if args.get(1).map(|s| s.as_str()) == Some("scan-arb") {
+        let execution_settings = app_config.execution_settings();
         let mut top_n: usize = 20;
         let mut max_sum = read_scan_max_sum(Path::new("src/.env"), Decimal::from_str("1.005")?);
         let mut min_edge = read_scan_min_edge(Path::new("src/.env"), Decimal::from_str("0.005")?);
+        let mut settle_guard_minutes = execution_settings.scan_min_minutes_to_settle;
         let mut i = 2usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -53,13 +55,24 @@ async fn main() -> anyhow::Result<()> {
                     min_edge = Decimal::from_str(&args[i + 1])?;
                     i += 2;
                 }
+                "--settle-guard-minutes" if i + 1 < args.len() => {
+                    settle_guard_minutes = args[i + 1].parse::<u64>()?;
+                    i += 2;
+                }
                 _ => {
                     i += 1;
                 }
             }
         }
 
-        run_scan_arb_once(&app_config.execution_settings(), top_n, max_sum, min_edge).await;
+        run_scan_arb_once(
+            &execution_settings,
+            top_n,
+            max_sum,
+            min_edge,
+            settle_guard_minutes,
+        )
+        .await;
         return Ok(());
     }
     let mut registry = StrategyRegistry::new();
@@ -84,9 +97,14 @@ async fn main() -> anyhow::Result<()> {
     let fetch_interval_secs = read_fetch_interval_secs(Path::new("src/.env"), 60);
     let scan_max_sum = read_scan_max_sum(Path::new("src/.env"), Decimal::from_str("1.005")?);
     let scan_min_edge = read_scan_min_edge(Path::new("src/.env"), Decimal::from_str("0.005")?);
+    let scan_settle_guard_minutes = execution_settings.scan_min_minutes_to_settle;
     println!("market scan interval={}s (from FETCH_INTERVAL)", fetch_interval_secs);
     println!("market scan max_sum={} (from SCAN_MAX_SUM)", scan_max_sum);
     println!("market scan min_edge={} (from SCAN_MIN_EDGE)", scan_min_edge);
+    println!(
+        "market scan settle_guard_minutes={} (from SCAN_MIN_MINUTES_TO_SETTLE)",
+        scan_settle_guard_minutes
+    );
     let context = StrategyContext {
         risk: RiskContext {
             total_capital: Decimal::from(100_000_i32),
@@ -143,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
             1000,
             scan_max_sum,
             scan_min_edge,
+            scan_settle_guard_minutes,
             &context,
             &mut runner,
             order_log_path.as_deref(),
@@ -168,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
             20,
             scan_max_sum,
             scan_min_edge,
+            scan_settle_guard_minutes,
             &context,
             &mut runner,
             None,
@@ -184,20 +204,34 @@ async fn run_scan_arb_once(
     top_n: usize,
     max_sum: Decimal,
     min_edge: Decimal,
+    settle_guard_minutes: u64,
 ) {
     let started = Utc::now();
     println!("scan_started_at={}", started.to_rfc3339());
-    match scan_arb_candidates(execution_settings, top_n, max_sum, min_edge).await {
+    match scan_arb_candidates(
+        execution_settings,
+        top_n,
+        max_sum,
+        min_edge,
+        settle_guard_minutes,
+    )
+    .await
+    {
         Ok(candidates) => {
             println!("arb_candidates_count={}", candidates.len());
             for (i, c) in candidates.iter().enumerate() {
+                let volume_24h = c
+                    .volume_24h
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "n/a".to_string());
                 println!(
-                    "#{:02} edge={} sum={} pA={} pB={} slug={} question={}",
+                    "#{:02} edge={} sum={} pA={} pB={} vol24h={} slug={} question={}",
                     i + 1,
                     c.edge,
                     c.sum,
                     c.price_a,
                     c.price_b,
+                    volume_24h,
                     c.market_slug,
                     c.question
                 );
@@ -215,6 +249,7 @@ async fn run_live_market_loop<C>(
     top_n: usize,
     max_sum: Decimal,
     min_edge: Decimal,
+    settle_guard_minutes: u64,
     context: &StrategyContext,
     runner: &mut EngineRunner<C>,
     order_log_path: Option<&Path>,
@@ -224,17 +259,30 @@ async fn run_live_market_loop<C>(
 {
     loop {
         println!("\n================ loop_at={} ================", Utc::now().to_rfc3339());
-        match scan_arb_candidates(execution_settings, top_n, max_sum, min_edge).await {
+        match scan_arb_candidates(
+            execution_settings,
+            top_n,
+            max_sum,
+            min_edge,
+            settle_guard_minutes,
+        )
+        .await
+        {
             Ok(candidates) => {
                 println!("scan_result_count={}", candidates.len());
                 for (idx, c) in candidates.iter().enumerate() {
+                    let volume_24h = c
+                        .volume_24h
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "n/a".to_string());
                     println!(
-                        "scan #{:02}: edge={} sum={} pA={} pB={} slug={} question={}",
+                        "scan #{:02}: edge={} sum={} pA={} pB={} vol24h={} slug={} question={}",
                         idx + 1,
                         c.edge,
                         c.sum,
                         c.price_a,
                         c.price_b,
+                        volume_24h,
                         c.market_slug,
                         c.question
                     );

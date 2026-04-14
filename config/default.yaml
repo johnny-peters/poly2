@@ -26,3 +26,4 @@ execution:
   timeout_secs: 10
   status_poll_attempts: 3
   status_poll_interval_ms: 500
+  scan_min_minutes_to_settle: 30

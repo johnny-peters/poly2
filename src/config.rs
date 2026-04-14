@@ -50,6 +50,8 @@ pub struct ExecutionFileConfig {
     pub status_poll_attempts: u32,
     #[serde(default = "default_status_poll_interval_ms")]
     pub status_poll_interval_ms: u64,
+    #[serde(default = "default_scan_min_minutes_to_settle")]
+    pub scan_min_minutes_to_settle: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -69,6 +71,7 @@ pub struct ExecutionSettings {
     pub timeout_secs: u64,
     pub status_poll_attempts: u32,
     pub status_poll_interval_ms: u64,
+    pub scan_min_minutes_to_settle: u64,
 }
 
 fn default_status_poll_attempts() -> u32 {
@@ -77,6 +80,10 @@ fn default_status_poll_attempts() -> u32 {
 
 fn default_status_poll_interval_ms() -> u64 {
     500
+}
+
+fn default_scan_min_minutes_to_settle() -> u64 {
+    30
 }
 
 impl AppConfig {
@@ -141,6 +148,7 @@ impl AppConfig {
             timeout_secs: self.execution.timeout_secs,
             status_poll_attempts: self.execution.status_poll_attempts,
             status_poll_interval_ms: self.execution.status_poll_interval_ms,
+            scan_min_minutes_to_settle: self.execution.scan_min_minutes_to_settle,
         }
     }
 
@@ -166,6 +174,11 @@ impl AppConfig {
         if let Some(v) = resolve_override("STATUS_POLL_INTERVAL_MS", dotenv_map) {
             if let Ok(ms) = v.parse::<u64>() {
                 self.execution.status_poll_interval_ms = ms.max(1);
+            }
+        }
+        if let Some(v) = resolve_override("SCAN_MIN_MINUTES_TO_SETTLE", dotenv_map) {
+            if let Ok(minutes) = v.parse::<u64>() {
+                self.execution.scan_min_minutes_to_settle = minutes;
             }
         }
     }

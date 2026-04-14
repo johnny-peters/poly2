@@ -73,6 +73,7 @@ cargo run -- scan-arb
 - `strategies`：策略开关与参数（如 `arbitrage.enabled`）
 - `risk`：风控参数（`max_position_pct` 等）
 - `execution`：执行与网络参数（HTTP/WS URL、重试、超时）
+  - 包含 `scan_min_minutes_to_settle`（扫描时过滤临近结算市场，默认 30 分钟）
 
 ### `src/.env`
 
@@ -85,6 +86,7 @@ cargo run -- scan-arb
 - `NETWORK_RETRY_LIMIT` 或 `RETRY_LIMIT` -> 覆盖 `execution.max_retries`
 - `REQUEST_TIMEOUT_MS` -> 覆盖 `execution.timeout_secs`
 - `STATUS_POLL_INTERVAL_MS` -> 覆盖 `execution.status_poll_interval_ms`
+- `SCAN_MIN_MINUTES_TO_SETTLE` -> 扫描时过滤“距离结算不足 N 分钟”的市场（默认 30）
 
 健康检查还会读取：
 

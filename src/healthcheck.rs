@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use chrono::Utc;
 use reqwest::Url;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -88,6 +89,7 @@ pub async fn scan_arb_candidates(
     top_n: usize,
     max_sum: Decimal,
     min_edge: Decimal,
+    settle_guard_minutes: u64,
 ) -> Result<Vec<ArbCandidate>> {
     const LATEST_WINDOW: usize = 200;
     let clob_base = "https://clob.polymarket.com";
@@ -110,12 +112,20 @@ pub async fn scan_arb_candidates(
             .ok_or_else(|| anyhow!("missing data array in markets response"))?
     };
 
+    let now_ms = Utc::now().timestamp_millis();
+    let min_end_time_ms = now_ms + (settle_guard_minutes as i64) * 60 * 1000;
     let mut active_open = Vec::new();
+    let mut filtered_non_tradeable = 0usize;
+    let mut filtered_near_settlement = 0usize;
     for m in data {
-        let active = m.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-        let closed = m.get("closed").and_then(|v| v.as_bool()).unwrap_or(true);
-        let archived = m.get("archived").and_then(|v| v.as_bool()).unwrap_or(true);
-        if !(active && !closed && !archived) {
+        if !is_market_tradeable(m) {
+            filtered_non_tradeable += 1;
+            continue;
+        }
+        if settle_guard_minutes > 0
+            && market_end_time_ms(m).is_some_and(|end_ms| end_ms <= min_end_time_ms)
+        {
+            filtered_near_settlement += 1;
             continue;
         }
         active_open.push(m);
@@ -179,8 +189,10 @@ pub async fn scan_arb_candidates(
         out.truncate(top_n);
     }
     println!(
-        "scan_filter_stats: total_raw={}, active_open={}, latest_window={}, token_ids_ok={}, clob_buy_price_ok={}, sum_below_threshold={}, edge_passed={}, min_edge={}, sorted_by=edge, top_returned={}",
+        "scan_filter_stats: total_raw={}, filtered_non_tradeable={}, filtered_near_settlement={}, active_open={}, latest_window={}, token_ids_ok={}, clob_buy_price_ok={}, sum_below_threshold={}, edge_passed={}, min_edge={}, settle_guard_minutes={}, sorted_by=edge, top_returned={}",
         data.len(),
+        filtered_non_tradeable,
+        filtered_near_settlement,
         active_open_count,
         window.len(),
         price_parsed_count,
@@ -188,9 +200,60 @@ pub async fn scan_arb_candidates(
         under_sum_count,
         edge_pass_count,
         min_edge,
+        settle_guard_minutes,
         out.len()
     );
     Ok(out)
+}
+
+fn bool_by_keys(market: &Value, keys: &[&str]) -> Option<bool> {
+    for key in keys {
+        if let Some(v) = market.get(key).and_then(|v| v.as_bool()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn is_market_tradeable(market: &Value) -> bool {
+    // Basic lifecycle filter.
+    let active = bool_by_keys(market, &["active"]).unwrap_or(false);
+    let closed = bool_by_keys(market, &["closed"]).unwrap_or(true);
+    let archived = bool_by_keys(market, &["archived"]).unwrap_or(true);
+    if !(active && !closed && !archived) {
+        return false;
+    }
+
+    // Additional status guards from different API payload variants.
+    if bool_by_keys(market, &["resolved", "isResolved"]).unwrap_or(false) {
+        return false;
+    }
+    if bool_by_keys(market, &["accepting_orders", "acceptingOrders", "enableOrderBook"])
+        == Some(false)
+    {
+        return false;
+    }
+
+    true
+}
+
+fn market_end_time_ms(market: &Value) -> Option<i64> {
+    for key in [
+        "endDate",
+        "end_date",
+        "endTime",
+        "end_time",
+        "closeTime",
+        "close_time",
+    ] {
+        let Some(s) = market.get(key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+            return Some(dt.timestamp_millis());
+        }
+    }
+    None
 }
 
 fn scan_markets_base_url(execution: &ExecutionSettings) -> String {
