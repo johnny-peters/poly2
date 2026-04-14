@@ -1,7 +1,9 @@
+use anyhow::{anyhow, Context};
 use chrono::Utc;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
@@ -17,13 +19,15 @@ use poly2::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    let dotenv_path = Path::new("src/.env");
     let app_config = AppConfig::load_from_path_with_env_overlay(
         "config/default.yaml",
-        Some("src/.env"),
+        Some(dotenv_path),
     )?;
     if args.get(1).map(|s| s.as_str()) == Some("healthcheck") {
-        let report = run_healthcheck(&app_config.execution_settings(), Path::new("src/.env")).await;
-        println!("healthcheck_passed={}", report.passed());
+        let report = run_healthcheck(&app_config.execution_settings(), dotenv_path).await;
+        let healthcheck_passed = report.passed();
+        println!("healthcheck_passed={healthcheck_passed}");
         for c in report.checks {
             println!(
                 "- [{}] {} => {}",
@@ -31,6 +35,20 @@ async fn main() -> anyhow::Result<()> {
                 c.name,
                 c.detail
             );
+        }
+        let strict = args.iter().any(|a| a == "--strict");
+        if strict {
+            println!("healthcheck_strict=true");
+            if !healthcheck_passed {
+                return Err(anyhow!("strict healthcheck failed: connectivity checks not passed"));
+            }
+            let preflight = run_startup_preflight(&app_config, dotenv_path)?;
+            print_preflight_report(&preflight);
+            if preflight.live_mode && preflight.trading_enabled && preflight.total_capital.is_none() {
+                return Err(anyhow!(
+                    "strict preflight failed: TOTAL_CAPITAL_USD or TOTAL_CAPITAL_CMD is required"
+                ));
+            }
         }
         return Ok(());
     }
@@ -105,9 +123,13 @@ async fn main() -> anyhow::Result<()> {
         "market scan settle_guard_minutes={} (from SCAN_MIN_MINUTES_TO_SETTLE)",
         scan_settle_guard_minutes
     );
+    let preflight = run_startup_preflight(&app_config, dotenv_path)?;
+    print_preflight_report(&preflight);
     let context = StrategyContext {
         risk: RiskContext {
-            total_capital: Decimal::from(100_000_i32),
+            total_capital: preflight
+                .total_capital
+                .unwrap_or_else(|| Decimal::from(100_000_i32)),
             position_per_market: HashMap::new(),
             daily_pnl: Decimal::ZERO,
         },
@@ -166,6 +188,8 @@ async fn main() -> anyhow::Result<()> {
             &mut runner,
             order_log_path.as_deref(),
             positions_path_ref,
+            dotenv_path,
+            &preflight,
         )
         .await;
     } else {
@@ -192,6 +216,8 @@ async fn main() -> anyhow::Result<()> {
             &mut runner,
             None,
             positions_path_ref,
+            dotenv_path,
+            &preflight,
         )
         .await;
     }
@@ -254,11 +280,48 @@ async fn run_live_market_loop<C>(
     runner: &mut EngineRunner<C>,
     order_log_path: Option<&Path>,
     positions_path: &Path,
+    dotenv_path: &Path,
+    preflight: &PreflightReport,
 ) where
     C: ExecutionClient,
 {
+    let mut loop_idx: u64 = 0;
+    let refresh_every = read_capital_refresh_loops(dotenv_path, 10);
+    let mut cached_capital = preflight.total_capital;
+    let mut cached_source = preflight.capital_source.clone();
+    let mut failure_breaker =
+        FailureCircuitBreaker::new(FailureCircuitBreakerConfig::from_env(dotenv_path));
     loop {
+        loop_idx += 1;
         println!("\n================ loop_at={} ================", Utc::now().to_rfc3339());
+        let trading_enabled = read_trading_enabled(dotenv_path, preflight.trading_enabled);
+        if !trading_enabled {
+            failure_breaker.reset();
+        }
+        let breaker_open = trading_enabled && failure_breaker.is_open(loop_idx);
+        let mut loop_context = context.clone();
+        let mut loop_outcome = LoopOutcome::Neutral;
+        if preflight.live_mode && trading_enabled {
+            let should_refresh = cached_capital.is_none() || loop_idx % refresh_every == 1;
+            if should_refresh {
+                match resolve_total_capital(dotenv_path) {
+                    Ok((capital, source)) => {
+                        cached_capital = Some(capital);
+                        cached_source = source;
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "capital refresh failed (loop={}): {}; trading skipped for safety",
+                            loop_idx, err
+                        );
+                    }
+                }
+            }
+            if let Some(capital) = cached_capital {
+                loop_context.risk.total_capital = capital;
+                println!("risk_total_capital={} source={}", capital, cached_source);
+            }
+        }
         match scan_arb_candidates(
             execution_settings,
             top_n,
@@ -291,9 +354,17 @@ async fn run_live_market_loop<C>(
                 let snapshots = to_market_snapshots(&candidates);
                 if snapshots.is_empty() {
                     println!("no executable snapshots in this loop");
+                } else if !trading_enabled {
+                    println!("trading_enabled=false: skip order execution, scan only");
+                } else if breaker_open {
+                    eprintln!(
+                        "ALERT circuit breaker open: skip execution at loop={}; close_at_loop={}",
+                        loop_idx,
+                        failure_breaker.open_until_loop().unwrap_or(loop_idx)
+                    );
                 } else {
                     let summary = runner
-                        .run_snapshots_with_report_hook(snapshots, context, |report| {
+                        .run_snapshots_with_report_hook(snapshots, &loop_context, |report| {
                             print_execution_report(report);
                             if let Some(path) = order_log_path {
                                 let _ = append_order_record(path, report);
@@ -317,16 +388,26 @@ async fn run_live_market_loop<C>(
                             );
                             if let Err(e) = save_positions(positions_path, runner.position_manager()) {
                                 eprintln!("persist positions failed: {}", e);
+                                loop_outcome = LoopOutcome::Failure;
+                            } else {
+                                loop_outcome = LoopOutcome::Success;
                             }
                         }
                         Err(err) => {
                             eprintln!("engine execute failed: {err}");
+                            loop_outcome = LoopOutcome::Failure;
                         }
                     }
                 }
             }
             Err(err) => {
                 eprintln!("market scan failed: {err}");
+                loop_outcome = LoopOutcome::Failure;
+            }
+        }
+        if trading_enabled {
+            if let Some(alert) = failure_breaker.observe(loop_outcome, loop_idx) {
+                eprintln!("ALERT {}", alert);
             }
         }
         time::sleep(Duration::from_secs(interval_secs.max(1))).await;
@@ -497,4 +578,327 @@ fn read_stop_loss_pct(dotenv_path: &Path) -> Option<Decimal> {
         }
     }
     None
+}
+
+#[derive(Clone, Debug)]
+struct FailureCircuitBreakerConfig {
+    consecutive_failure_limit: u64,
+    window_loops: usize,
+    max_failure_rate: f64,
+    cooldown_loops: u64,
+}
+
+impl FailureCircuitBreakerConfig {
+    fn from_env(dotenv_path: &Path) -> Self {
+        let consecutive_failure_limit = resolve_runtime_var("CB_CONSECUTIVE_FAILURE_LIMIT", dotenv_path)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(3)
+            .max(1);
+        let window_loops = resolve_runtime_var("CB_WINDOW_LOOPS", dotenv_path)
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(20)
+            .max(1);
+        let max_failure_rate = resolve_runtime_var("CB_MAX_FAILURE_RATE", dotenv_path)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(0.5);
+        let cooldown_loops = resolve_runtime_var("CB_COOLDOWN_LOOPS", dotenv_path)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(5)
+            .max(1);
+        Self {
+            consecutive_failure_limit,
+            window_loops,
+            max_failure_rate,
+            cooldown_loops,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum LoopOutcome {
+    Success,
+    Failure,
+    Neutral,
+}
+
+#[derive(Clone, Debug)]
+struct FailureCircuitBreaker {
+    config: FailureCircuitBreakerConfig,
+    consecutive_failures: u64,
+    recent_failures: VecDeque<bool>,
+    open_until_loop: Option<u64>,
+}
+
+impl FailureCircuitBreaker {
+    fn new(config: FailureCircuitBreakerConfig) -> Self {
+        Self {
+            config,
+            consecutive_failures: 0,
+            recent_failures: VecDeque::new(),
+            open_until_loop: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+        self.recent_failures.clear();
+        self.open_until_loop = None;
+    }
+
+    fn is_open(&self, loop_idx: u64) -> bool {
+        self.open_until_loop.is_some_and(|until| loop_idx <= until)
+    }
+
+    fn open_until_loop(&self) -> Option<u64> {
+        self.open_until_loop
+    }
+
+    fn observe(&mut self, outcome: LoopOutcome, loop_idx: u64) -> Option<String> {
+        match outcome {
+            LoopOutcome::Neutral => return None,
+            LoopOutcome::Success => {
+                self.consecutive_failures = 0;
+                self.record_failure_flag(false);
+                if self.open_until_loop.is_some() {
+                    self.open_until_loop = None;
+                    return Some("circuit breaker closed after successful loop".to_string());
+                }
+                return None;
+            }
+            LoopOutcome::Failure => {
+                self.consecutive_failures += 1;
+                self.record_failure_flag(true);
+            }
+        }
+
+        if self.open_until_loop.is_some_and(|until| loop_idx <= until) {
+            return None;
+        }
+
+        if self.consecutive_failures >= self.config.consecutive_failure_limit {
+            let until = loop_idx + self.config.cooldown_loops;
+            self.open_until_loop = Some(until);
+            return Some(format!(
+                "circuit breaker opened: consecutive_failures={} threshold={} cooldown_loops={} close_at_loop={}",
+                self.consecutive_failures,
+                self.config.consecutive_failure_limit,
+                self.config.cooldown_loops,
+                until
+            ));
+        }
+
+        let window_size = self.recent_failures.len();
+        if window_size >= self.config.window_loops {
+            let failures = self.recent_failures.iter().filter(|v| **v).count();
+            let failure_rate = failures as f64 / window_size as f64;
+            if failure_rate >= self.config.max_failure_rate {
+                let until = loop_idx + self.config.cooldown_loops;
+                self.open_until_loop = Some(until);
+                return Some(format!(
+                    "circuit breaker opened: failure_rate={:.2} threshold={:.2} window={} cooldown_loops={} close_at_loop={}",
+                    failure_rate,
+                    self.config.max_failure_rate,
+                    window_size,
+                    self.config.cooldown_loops,
+                    until
+                ));
+            }
+        }
+
+        None
+    }
+
+    fn record_failure_flag(&mut self, is_failure: bool) {
+        self.recent_failures.push_back(is_failure);
+        while self.recent_failures.len() > self.config.window_loops {
+            self.recent_failures.pop_front();
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreflightReport {
+    live_mode: bool,
+    trading_enabled: bool,
+    total_capital: Option<Decimal>,
+    capital_source: String,
+}
+
+fn run_startup_preflight(app_config: &AppConfig, dotenv_path: &Path) -> anyhow::Result<PreflightReport> {
+    let live_mode = app_config.execution.polymarket_http_url.is_some();
+    let trading_enabled = read_trading_enabled(dotenv_path, true);
+    let mut total_capital = None;
+    let mut capital_source = "n/a".to_string();
+
+    if live_mode && trading_enabled {
+        if let Some(api_key_env) = &app_config.execution.api_key_env {
+            let val = resolve_runtime_var(api_key_env, dotenv_path);
+            if val.as_deref().map(str::trim).unwrap_or_default().is_empty() {
+                return Err(anyhow!(
+                    "preflight failed: required api key env '{}' is missing/empty",
+                    api_key_env
+                ));
+            }
+        }
+        if let Some(signature_env) = &app_config.execution.signature_env {
+            let val = resolve_runtime_var(signature_env, dotenv_path);
+            if val.as_deref().map(str::trim).unwrap_or_default().is_empty() {
+                return Err(anyhow!(
+                    "preflight failed: required signature env '{}' is missing/empty",
+                    signature_env
+                ));
+            }
+        }
+
+        let (capital, source) = resolve_total_capital(dotenv_path)?;
+        total_capital = Some(capital);
+        capital_source = source;
+
+        let min_total_capital = read_decimal_var(dotenv_path, "MIN_TOTAL_CAPITAL_USD")
+            .unwrap_or_else(|| Decimal::ONE);
+        if capital < min_total_capital {
+            return Err(anyhow!(
+                "preflight failed: capital={} below MIN_TOTAL_CAPITAL_USD={}",
+                capital,
+                min_total_capital
+            ));
+        }
+
+        if app_config.strategies.arbitrage.enabled {
+            let arb = app_config.arbitrage_config()?;
+            let min_order_size = read_decimal_var(dotenv_path, "MIN_ORDER_SIZE_USD")
+                .unwrap_or_else(|| Decimal::ONE);
+            if arb.order_size < min_order_size {
+                return Err(anyhow!(
+                    "preflight failed: arbitrage order_size={} < MIN_ORDER_SIZE_USD={}",
+                    arb.order_size,
+                    min_order_size
+                ));
+            }
+        }
+    }
+
+    Ok(PreflightReport {
+        live_mode,
+        trading_enabled,
+        total_capital,
+        capital_source,
+    })
+}
+
+fn print_preflight_report(preflight: &PreflightReport) {
+    println!(
+        "preflight: live_mode={}, trading_enabled={}",
+        preflight.live_mode, preflight.trading_enabled
+    );
+    if let Some(capital) = preflight.total_capital {
+        println!(
+            "preflight: total_capital={} source={}",
+            capital, preflight.capital_source
+        );
+    }
+}
+
+fn resolve_total_capital(dotenv_path: &Path) -> anyhow::Result<(Decimal, String)> {
+    if let Some(raw) = resolve_runtime_var("TOTAL_CAPITAL_USD", dotenv_path) {
+        let parsed = Decimal::from_str(raw.trim())
+            .with_context(|| format!("invalid TOTAL_CAPITAL_USD value: {}", raw.trim()))?;
+        if parsed <= Decimal::ZERO {
+            return Err(anyhow!("TOTAL_CAPITAL_USD must be > 0"));
+        }
+        return Ok((parsed, "TOTAL_CAPITAL_USD".to_string()));
+    }
+    if let Some(cmd) = resolve_runtime_var("TOTAL_CAPITAL_CMD", dotenv_path) {
+        let output = if cfg!(target_os = "windows") {
+            Command::new("powershell")
+                .args(["-NoProfile", "-Command", cmd.trim()])
+                .output()
+        } else {
+            Command::new("sh").args(["-lc", cmd.trim()]).output()
+        }
+        .context("failed to execute TOTAL_CAPITAL_CMD")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "TOTAL_CAPITAL_CMD failed with status {}",
+                output.status
+            ));
+        }
+        let stdout = String::from_utf8(output.stdout).context("TOTAL_CAPITAL_CMD stdout is not utf-8")?;
+        let line = stdout.lines().next().unwrap_or("").trim();
+        if line.is_empty() {
+            return Err(anyhow!("TOTAL_CAPITAL_CMD returned empty output"));
+        }
+        let parsed = Decimal::from_str(line)
+            .with_context(|| format!("TOTAL_CAPITAL_CMD output is not decimal: '{line}'"))?;
+        if parsed <= Decimal::ZERO {
+            return Err(anyhow!("TOTAL_CAPITAL_CMD must output a value > 0"));
+        }
+        return Ok((parsed, "TOTAL_CAPITAL_CMD".to_string()));
+    }
+    Err(anyhow!(
+        "missing capital source: set TOTAL_CAPITAL_USD or TOTAL_CAPITAL_CMD"
+    ))
+}
+
+fn read_capital_refresh_loops(dotenv_path: &Path, default_loops: u64) -> u64 {
+    resolve_runtime_var("CAPITAL_REFRESH_LOOPS", dotenv_path)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default_loops)
+        .max(1)
+}
+
+fn read_trading_enabled(dotenv_path: &Path, default_value: bool) -> bool {
+    let Some(raw) = resolve_runtime_var("TRADING_ENABLED", dotenv_path) else {
+        return default_value;
+    };
+    parse_bool_flag(raw.trim()).unwrap_or(default_value)
+}
+
+fn parse_bool_flag(raw: &str) -> Option<bool> {
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn read_decimal_var(dotenv_path: &Path, key: &str) -> Option<Decimal> {
+    resolve_runtime_var(key, dotenv_path).and_then(|v| Decimal::from_str(v.trim()).ok())
+}
+
+fn resolve_runtime_var(key: &str, dotenv_path: &Path) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .or_else(|| load_dotenv_map(dotenv_path).get(key).cloned())
+}
+
+fn load_dotenv_map(path: &Path) -> HashMap<String, String> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = k.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let mut val = v.trim().to_string();
+        if (val.starts_with('"') && val.ends_with('"'))
+            || (val.starts_with('\'') && val.ends_with('\''))
+        {
+            val = val[1..val.len() - 1].to_string();
+        } else if let Some((head, _)) = val.split_once('#') {
+            val = head.trim().to_string();
+        }
+        out.insert(key, val);
+    }
+    out
 }

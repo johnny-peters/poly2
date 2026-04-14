@@ -48,6 +48,12 @@ cargo run
 cargo run -- healthcheck
 ```
 
+严格模式（会额外执行启动前 preflight 校验）：
+
+```bash
+cargo run -- healthcheck --strict
+```
+
 会输出：
 
 - `healthcheck_passed=true/false`
@@ -87,6 +93,16 @@ cargo run -- scan-arb
 - `REQUEST_TIMEOUT_MS` -> 覆盖 `execution.timeout_secs`
 - `STATUS_POLL_INTERVAL_MS` -> 覆盖 `execution.status_poll_interval_ms`
 - `SCAN_MIN_MINUTES_TO_SETTLE` -> 扫描时过滤“距离结算不足 N 分钟”的市场（默认 30）
+- `TRADING_ENABLED` -> `false` 时仅扫描不下单（支持 `true/false/1/0/on/off`）
+- `TOTAL_CAPITAL_USD` -> 风控总资金（优先用于实盘）
+- `TOTAL_CAPITAL_CMD` -> 通过外部命令输出风控总资金（首行必须是正数）
+- `CAPITAL_REFRESH_LOOPS` -> 每 N 轮刷新一次风控总资金（默认 10）
+- `MIN_TOTAL_CAPITAL_USD` -> preflight 允许的最小总资金（默认 1）
+- `MIN_ORDER_SIZE_USD` -> preflight 校验套利 `order_size` 下限（默认 1）
+- `CB_CONSECUTIVE_FAILURE_LIMIT` -> 连续失败达到该值触发熔断（默认 3）
+- `CB_WINDOW_LOOPS` -> 失败率统计窗口（按 loop 数，默认 20）
+- `CB_MAX_FAILURE_RATE` -> 窗口失败率达到该阈值触发熔断（0~1，默认 0.5）
+- `CB_COOLDOWN_LOOPS` -> 熔断后跳过执行的 loop 数（默认 5）
 
 健康检查还会读取：
 
