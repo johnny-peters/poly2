@@ -80,6 +80,16 @@ pub enum ExecutionError {
 #[async_trait]
 pub trait ExecutionClient: Send + Sync {
     async fn submit(&self, signal: &StrategySignal) -> Result<ExecutionReport, ExecutionError>;
+
+    async fn get_order_status(&self, order_id: &str) -> Result<ExecutionStatus, ExecutionError> {
+        let _ = order_id;
+        Err(ExecutionError::Backend("get_order_status not supported".into()))
+    }
+
+    async fn cancel_order(&self, order_id: &str) -> Result<(), ExecutionError> {
+        let _ = order_id;
+        Err(ExecutionError::Backend("cancel_order not supported".into()))
+    }
 }
 
 pub struct EventingExecutionClient<C> {
@@ -187,6 +197,14 @@ where
             }
         }
     }
+
+    async fn get_order_status(&self, order_id: &str) -> Result<ExecutionStatus, ExecutionError> {
+        self.inner.get_order_status(order_id).await
+    }
+
+    async fn cancel_order(&self, order_id: &str) -> Result<(), ExecutionError> {
+        self.inner.cancel_order(order_id).await
+    }
 }
 
 #[async_trait]
@@ -234,6 +252,14 @@ where
             error: None,
         });
         Ok(report)
+    }
+
+    async fn get_order_status(&self, order_id: &str) -> Result<ExecutionStatus, ExecutionError> {
+        self.inner.get_order_status(order_id).await
+    }
+
+    async fn cancel_order(&self, order_id: &str) -> Result<(), ExecutionError> {
+        self.inner.cancel_order(order_id).await
     }
 }
 
@@ -355,6 +381,44 @@ impl ExecutionClient for PolymarketSdkExecutionClient {
             fills,
             signal: signal.clone(),
         })
+    }
+
+    async fn get_order_status(&self, order_id: &str) -> Result<ExecutionStatus, ExecutionError> {
+        let resp = self
+            .client
+            .order(order_id)
+            .await
+            .map_err(|e| ExecutionError::Backend(format!("get order failed: {e}")))?;
+        if resp.size_matched >= resp.original_size && resp.original_size > Decimal::ZERO {
+            return Ok(ExecutionStatus::Filled);
+        }
+        if resp.size_matched > Decimal::ZERO {
+            return Ok(ExecutionStatus::PartiallyFilled);
+        }
+        Ok(Self::map_status(&resp.status, true))
+    }
+
+    async fn cancel_order(&self, order_id: &str) -> Result<(), ExecutionError> {
+        let resp = self
+            .client
+            .cancel_order(order_id)
+            .await
+            .map_err(|e| ExecutionError::Backend(format!("cancel order failed: {e}")))?;
+        if resp.not_canceled.is_empty() {
+            return Ok(());
+        }
+        let is_matched = resp.not_canceled.values().any(|reason| {
+            let r = reason.to_lowercase();
+            r.contains("matched") || r.contains("filled")
+        });
+        if is_matched {
+            Ok(())
+        } else {
+            Err(ExecutionError::Backend(format!(
+                "cancel rejected: {:?}",
+                resp.not_canceled
+            )))
+        }
     }
 }
 

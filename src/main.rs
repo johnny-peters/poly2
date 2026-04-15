@@ -18,7 +18,7 @@ use tokio::time::{self, Duration};
 
 use poly2::{
     run_healthcheck, scan_arb_candidates, AppConfig, ArbitrageStrategy,
-    ExecutionClient, ExecutionReport, ExecutionSettings,
+    ExecutionClient, ExecutionReport, ExecutionSettings, ExecutionStatus,
     MockExecutionClient, RetryingExecutionClient, RiskContext, RiskEngine,
     PolymarketSdkExecutionClient, StrategyContext, StrategyId, StrategyRegistry, TodoStrategy,
     TradingEngine, discover_btc_candle_market,
@@ -92,7 +92,7 @@ async fn run_btc_candle_loop<C>(
         "BTC_CANDLE_TAKE_PROFIT",
         Decimal::from_str("0.84").unwrap_or(Decimal::from(84_u32) / Decimal::from(100_u32)),
     );
-    let poll_ms = read_u64_env_or(dotenv_path, "BTC_CANDLE_POLL_MS", 2000);
+    let poll_ms = read_u64_env_or(dotenv_path, "BTC_CANDLE_POLL_MS", 1000);
 
     println!(
         "btc_candle: order_usd={}, entry_threshold={}, stop_loss={}, take_profit={}, poll_ms={}",
@@ -101,28 +101,39 @@ async fn run_btc_candle_loop<C>(
 
     let _ = context;
     let mut loop_idx: u64 = 0;
+    let mut first_round = true;
     loop {
         loop_idx += 1;
 
-        // --- Phase 1: sleep until the NEXT 5-min window boundary ---
         let now_secs = Utc::now().timestamp();
         let current_window = now_secs - (now_secs.rem_euclid(300));
-        let next_window = current_window + 300;
-        let sleep_to_boundary = (next_window - now_secs).max(0) as u64;
-        println!(
-            "\n================ btc5m round #{} waiting for window ================\n\
-             now={} next_window_ts={} sleeping={}s",
-            loop_idx,
-            Utc::now().to_rfc3339(),
-            next_window,
-            sleep_to_boundary
-        );
-        if sleep_to_boundary > 0 {
-            time::sleep(Duration::from_secs(sleep_to_boundary)).await;
-        }
 
-        let window_ts = next_window;
-        let close_ts = window_ts + 300;
+        let (window_ts, close_ts) = if first_round {
+            first_round = false;
+            println!(
+                "\n================ btc5m round #{} (immediate start) ================\n\
+                 now={} current_window_ts={}",
+                loop_idx,
+                Utc::now().to_rfc3339(),
+                current_window,
+            );
+            (current_window, current_window + 300)
+        } else {
+            let next_window = current_window + 300;
+            let sleep_to_boundary = (next_window - now_secs).max(0) as u64;
+            println!(
+                "\n================ btc5m round #{} waiting for window ================\n\
+                 now={} next_window_ts={} sleeping={}s",
+                loop_idx,
+                Utc::now().to_rfc3339(),
+                next_window,
+                sleep_to_boundary
+            );
+            if sleep_to_boundary > 0 {
+                time::sleep(Duration::from_secs(sleep_to_boundary)).await;
+            }
+            (next_window, next_window + 300)
+        };
 
         // --- Phase 2: discover the market for this window ---
         let market = match discover_btc_candle_market(window_ts).await {
@@ -176,7 +187,8 @@ async fn run_btc_candle_loop<C>(
                 time::sleep(Duration::from_millis(poll_ms)).await;
                 continue 'entry;
             }
-            let size = (order_usd / trigger_price).round_dp(2);
+            let min_size = Decimal::from(5_u32);
+            let size = (order_usd / trigger_price).round_dp(2).max(min_size);
             println!(
                 "btc_candle: ENTRY triggered! side={:?} price={} size={} (order_usd={})",
                 trigger_side, trigger_price, size, order_usd
@@ -199,9 +211,71 @@ async fn run_btc_candle_loop<C>(
             match execution.submit(&signal).await {
                 Ok(report) => {
                     print_execution_report(&report);
-                    bought_side = Some(trigger_side);
-                    bought_token_id = trigger_token;
-                    bought_size = size;
+                    let mut final_status = report.status.clone();
+                    let order_id_for_poll = report.order_ids.first().cloned();
+
+                    if matches!(final_status, ExecutionStatus::Pending) {
+                        if let Some(ref oid) = order_id_for_poll {
+                            println!("btc_candle: order pending, polling up to 5s for fill...");
+                            let poll_deadline = Utc::now().timestamp() + 5;
+                            loop {
+                                time::sleep(Duration::from_millis(1000)).await;
+                                match execution.get_order_status(oid).await {
+                                    Ok(s) => {
+                                        println!("btc_candle: poll status={:?}", s);
+                                        final_status = s;
+                                        if !matches!(final_status, ExecutionStatus::Pending) {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("btc_candle: poll error: {e}");
+                                    }
+                                }
+                                if Utc::now().timestamp() >= poll_deadline {
+                                    break;
+                                }
+                            }
+
+                            if matches!(final_status, ExecutionStatus::Pending) {
+                                println!("btc_candle: still pending after 5s, cancelling order {oid}");
+                                match execution.cancel_order(oid).await {
+                                    Ok(()) => {
+                                        println!("btc_candle: cancel accepted, re-checking status...");
+                                        if let Ok(s) = execution.get_order_status(oid).await {
+                                            println!("btc_candle: post-cancel status={:?}", s);
+                                            final_status = s;
+                                        }
+                                    }
+                                    Err(e) => eprintln!("btc_candle: cancel failed: {e}"),
+                                }
+                            }
+                        }
+                    }
+
+                    match final_status {
+                        ExecutionStatus::Filled | ExecutionStatus::PartiallyFilled => {
+                            bought_side = Some(trigger_side);
+                            bought_token_id = trigger_token;
+                            let fill_size_sum: Decimal =
+                                report.fills.iter().filter(|f| !f.sell).map(|f| f.size).sum();
+                            bought_size = if fill_size_sum > Decimal::ZERO && fill_size_sum < size {
+                                fill_size_sum
+                            } else {
+                                (size * Decimal::new(995, 3)).round_dp(2)
+                            };
+                            println!(
+                                "btc_candle: adjusted bought_size={} (raw={})",
+                                bought_size, size
+                            );
+                        }
+                        _ => {
+                            eprintln!(
+                                "btc_candle: buy order not filled (status={:?}), skipping entry",
+                                final_status
+                            );
+                        }
+                    }
                 }
                 Err(err) => eprintln!("btc_candle: buy execution failed: {err}"),
             }
