@@ -9,7 +9,7 @@ use polymarket_client_sdk::{
     derive_proxy_wallet, derive_safe_wallet, POLYGON as PM_POLYGON, PRIVATE_KEY_VAR,
 };
 use rust_decimal::Decimal;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 use std::str::FromStr;
@@ -17,18 +17,18 @@ use std::sync::Arc;
 use tokio::time::{self, Duration};
 
 use poly2::{
-    append_order_record, fetch_market_snapshots_by_ids, fetch_usdc_balance,
-    run_healthcheck, save_positions, scan_arb_candidates, AppConfig, ArbitrageStrategy,
-    EngineRunner, ExecutionClient, ExecutionReport, ExecutionSettings, MarketSnapshot,
+    run_healthcheck, scan_arb_candidates, AppConfig, ArbitrageStrategy,
+    ExecutionClient, ExecutionReport, ExecutionSettings,
     MockExecutionClient, RetryingExecutionClient, RiskContext, RiskEngine,
     PolymarketSdkExecutionClient, StrategyContext, StrategyId, StrategyRegistry, TodoStrategy,
     TradingEngine, discover_btc_candle_market,
 };
 
-async fn fetch_clob_best_ask(token_id: &str) -> anyhow::Result<Decimal> {
+async fn fetch_clob_price(token_id: &str, side: &str) -> anyhow::Result<Decimal> {
     let url = format!(
-        "https://clob.polymarket.com/price?token_id={}&side=buy",
-        token_id.trim()
+        "https://clob.polymarket.com/price?token_id={}&side={}",
+        token_id.trim(),
+        side
     );
     let resp = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
@@ -48,118 +48,12 @@ async fn fetch_clob_best_ask(token_id: &str) -> anyhow::Result<Decimal> {
     Ok(Decimal::from_str(raw.trim())?)
 }
 
-/// Spawn a background task that maintains a persistent Polymarket RTDS WebSocket
-/// connection, continuously updating the latest Chainlink BTC/USD price.
-/// Returns a `watch::Receiver<Option<Decimal>>` that always holds the freshest price.
-fn spawn_rtds_btc_price_feed() -> tokio::sync::watch::Receiver<Option<Decimal>> {
-    let (tx, rx) = tokio::sync::watch::channel(None::<Decimal>);
-    tokio::spawn(async move {
-        loop {
-            if let Err(e) = rtds_btc_price_loop(&tx).await {
-                eprintln!("RTDS feed error: {e} — reconnecting in 3s");
-            }
-            tokio::time::sleep(Duration::from_secs(3)).await;
-        }
-    });
-    rx
+async fn fetch_clob_best_ask(token_id: &str) -> anyhow::Result<Decimal> {
+    fetch_clob_price(token_id, "buy").await
 }
 
-async fn rtds_btc_price_loop(
-    tx: &tokio::sync::watch::Sender<Option<Decimal>>,
-) -> anyhow::Result<()> {
-    use futures::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
-
-    let (mut ws, _resp) = tokio_tungstenite::connect_async("wss://ws-live-data.polymarket.com")
-        .await
-        .context("RTDS WebSocket connect failed")?;
-    println!("RTDS: connected to wss://ws-live-data.polymarket.com");
-
-    let sub_msg = serde_json::json!({
-        "action": "subscribe",
-        "subscriptions": [{
-            "topic": "crypto_prices_chainlink",
-            "type": "*",
-            "filters": "{\"symbol\":\"btc/usd\"}"
-        }]
-    });
-    ws.send(Message::Text(sub_msg.to_string().into()))
-        .await
-        .context("RTDS subscribe send failed")?;
-
-    let mut last_ping = tokio::time::Instant::now();
-    let ping_interval = Duration::from_secs(5);
-
-    loop {
-        let msg = tokio::select! {
-            m = ws.next() => match m {
-                Some(Ok(m)) => m,
-                Some(Err(e)) => return Err(anyhow!("RTDS ws read error: {e}")),
-                None => return Err(anyhow!("RTDS ws closed")),
-            },
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                return Err(anyhow!("RTDS ws: no message for 30s"));
-            }
-        };
-
-        if last_ping.elapsed() >= ping_interval {
-            let _ = ws.send(Message::text("PING")).await;
-            last_ping = tokio::time::Instant::now();
-        }
-
-        let text = match &msg {
-            Message::Text(t) => t.clone(),
-            Message::Ping(d) => {
-                let _ = ws.send(Message::Pong(d.clone())).await;
-                continue;
-            }
-            _ => continue,
-        };
-
-        let val: serde_json::Value = match serde_json::from_str(text.as_ref()) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        if val.get("topic").and_then(|t| t.as_str()) != Some("crypto_prices_chainlink") {
-            continue;
-        }
-        if let Some(payload) = val.get("payload") {
-            if payload.get("symbol").and_then(|s| s.as_str()) == Some("btc/usd") {
-                if let Some(price_f64) = payload.get("value").and_then(|v| v.as_f64()) {
-                    let price_str = format!("{:.2}", price_f64);
-                    if let Ok(price) = Decimal::from_str(&price_str) {
-                        tx.send_replace(Some(price));
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Read the latest BTC/USD price from the persistent RTDS feed.
-/// Waits up to `timeout_secs` for a valid price if none is available yet.
-async fn read_btc_price(
-    rx: &mut tokio::sync::watch::Receiver<Option<Decimal>>,
-    timeout_secs: u64,
-) -> anyhow::Result<Decimal> {
-    if let Some(p) = *rx.borrow() {
-        return Ok(p);
-    }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        tokio::select! {
-            res = rx.changed() => {
-                res.map_err(|_| anyhow!("RTDS feed channel closed"))?;
-                if let Some(p) = *rx.borrow() {
-                    return Ok(p);
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                return Err(anyhow!("RTDS price not available after {timeout_secs}s"));
-            }
-        }
-    }
+async fn fetch_clob_best_bid(token_id: &str) -> anyhow::Result<Decimal> {
+    fetch_clob_price(token_id, "sell").await
 }
 
 fn read_decimal_env_or(dotenv_path: &Path, key: &str, default_value: Decimal) -> Decimal {
@@ -175,7 +69,7 @@ fn read_u64_env_or(dotenv_path: &Path, key: &str, default_value: u64) -> u64 {
 }
 
 async fn run_btc_candle_loop<C>(
-    interval_secs: u64,
+    _interval_secs: u64,
     context: &StrategyContext,
     execution: &C,
     dotenv_path: &Path,
@@ -183,35 +77,32 @@ async fn run_btc_candle_loop<C>(
     C: ExecutionClient,
 {
     let order_usd = read_decimal_env_or(dotenv_path, "BTC_CANDLE_ORDER_USD", Decimal::from(2_u32));
-    let min_price = read_decimal_env_or(
+    let entry_threshold = read_decimal_env_or(
         dotenv_path,
-        "BTC_CANDLE_MIN_PRICE",
-        Decimal::from_str("0.85").unwrap_or(Decimal::from(85_u32) / Decimal::from(100_u32)),
+        "BTC_CANDLE_ENTRY_THRESHOLD",
+        Decimal::from_str("0.72").unwrap_or(Decimal::from(72_u32) / Decimal::from(100_u32)),
     );
-    let entry_before_close_secs =
-        read_u64_env_or(dotenv_path, "BTC_CANDLE_ENTRY_BEFORE_CLOSE_SECS", 30).min(299);
-    let min_abs_diff = read_decimal_env_or(
+    let stop_loss_price = read_decimal_env_or(
         dotenv_path,
-        "BTC_CANDLE_MIN_ABS_DIFF",
-        Decimal::from(30_u32),
+        "BTC_CANDLE_STOP_LOSS",
+        Decimal::from_str("0.50").unwrap_or(Decimal::from(1_u32) / Decimal::from(2_u32)),
     );
+    let take_profit_price = read_decimal_env_or(
+        dotenv_path,
+        "BTC_CANDLE_TAKE_PROFIT",
+        Decimal::from_str("0.84").unwrap_or(Decimal::from(84_u32) / Decimal::from(100_u32)),
+    );
+    let poll_ms = read_u64_env_or(dotenv_path, "BTC_CANDLE_POLL_MS", 2000);
 
     println!(
-        "btc_candle: order_usd={}, min_price={}, entry_before_close_secs={}, min_abs_diff={}",
-        order_usd, min_price, entry_before_close_secs, min_abs_diff
+        "btc_candle: order_usd={}, entry_threshold={}, stop_loss={}, take_profit={}, poll_ms={}",
+        order_usd, entry_threshold, stop_loss_price, take_profit_price, poll_ms
     );
 
-    let mut price_rx = spawn_rtds_btc_price_feed();
-
-    // Wait for the first price to arrive before entering the loop
-    match read_btc_price(&mut price_rx, 30).await {
-        Ok(p) => println!("RTDS: initial BTC/USD price = {}", p),
-        Err(e) => eprintln!("RTDS: warning, initial price not yet available: {e}"),
-    }
-
-    let mut _loop_idx: u64 = 0;
+    let _ = context;
+    let mut loop_idx: u64 = 0;
     loop {
-        _loop_idx += 1;
+        loop_idx += 1;
 
         // --- Phase 1: sleep until the NEXT 5-min window boundary ---
         let now_secs = Utc::now().timestamp();
@@ -219,8 +110,9 @@ async fn run_btc_candle_loop<C>(
         let next_window = current_window + 300;
         let sleep_to_boundary = (next_window - now_secs).max(0) as u64;
         println!(
-            "\n================ btc5m waiting for window boundary ================\n\
+            "\n================ btc5m round #{} waiting for window ================\n\
              now={} next_window_ts={} sleeping={}s",
+            loop_idx,
             Utc::now().to_rfc3339(),
             next_window,
             sleep_to_boundary
@@ -229,134 +121,175 @@ async fn run_btc_candle_loop<C>(
             time::sleep(Duration::from_secs(sleep_to_boundary)).await;
         }
 
-        // --- Phase 2: at window boundary, capture Price to Beat ---
         let window_ts = next_window;
         let close_ts = window_ts + 300;
-        let entry_ts = close_ts - (entry_before_close_secs as i64);
 
-        let price_to_beat = match read_btc_price(&mut price_rx, 10).await {
-            Ok(p) => {
-                println!(
-                    "window_ts={} close_ts={} price_to_beat(chainlink)={} captured_at={}",
-                    window_ts, close_ts, p, Utc::now().to_rfc3339()
-                );
-                p
-            }
-            Err(err) => {
-                eprintln!(
-                    "RTDS price_to_beat unavailable at window boundary: {err}"
-                );
-                time::sleep(Duration::from_secs(interval_secs.max(1))).await;
-                continue;
-            }
-        };
-
-        // --- Phase 3: sleep until T-30s before close ---
-        let now_secs2 = Utc::now().timestamp();
-        if now_secs2 < entry_ts {
-            let sleep_for = (entry_ts - now_secs2) as u64;
-            println!("btc_candle: sleeping {}s until entry_ts={}", sleep_for, entry_ts);
-            time::sleep(Duration::from_secs(sleep_for)).await;
-        }
-
-        // --- Phase 4: read current price instantly from live feed ---
-        let current_price = match read_btc_price(&mut price_rx, 10).await {
-            Ok(p) => p,
-            Err(err) => {
-                eprintln!("btc_candle: RTDS current_price unavailable: {err}");
-                time::sleep(Duration::from_secs(interval_secs.max(1))).await;
-                continue;
-            }
-        };
-        let abs_diff = (price_to_beat - current_price).abs();
-        println!(
-            "btc_candle: price_to_beat={} current_price={} abs_diff={}",
-            price_to_beat, current_price, abs_diff
-        );
-        if abs_diff < min_abs_diff {
-            println!(
-                "btc_candle: skip (|a-b|={} < min_abs_diff={})",
-                abs_diff, min_abs_diff
-            );
-            time::sleep(Duration::from_secs(interval_secs.max(1))).await;
-            continue;
-        }
-
-        // --- Phase 5: discover market & check odds ---
+        // --- Phase 2: discover the market for this window ---
         let market = match discover_btc_candle_market(window_ts).await {
             Ok(m) => m,
             Err(err) => {
                 eprintln!("btc_candle: market discovery failed: {err}");
-                time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+                time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
         };
         println!(
-            "btc_candle: market_id={} slug={} up_token_id={} down_token_id={}",
+            "btc_candle: market_id={} slug={} up_token={} down_token={}",
             market.market_id, market.market_slug, market.up_token_id, market.down_token_id
         );
 
-        let up_ask = match fetch_clob_best_ask(&market.up_token_id).await {
-            Ok(p) => p,
-            Err(err) => {
-                eprintln!("btc_candle: fetch up ask failed: {err}");
-                time::sleep(Duration::from_secs(interval_secs.max(1))).await;
-                continue;
+        // --- Phase 3: poll ask prices until one exceeds entry_threshold ---
+        let mut bought_side: Option<poly2::Side> = None;
+        let mut bought_token_id = String::new();
+        let mut bought_size = Decimal::ZERO;
+
+        'entry: loop {
+            let now = Utc::now().timestamp();
+            if now >= close_ts - 10 {
+                println!("btc_candle: window closing soon, no entry this round");
+                break 'entry;
             }
-        };
-        let down_ask = match fetch_clob_best_ask(&market.down_token_id).await {
-            Ok(p) => p,
-            Err(err) => {
-                eprintln!("btc_candle: fetch down ask failed: {err}");
-                time::sleep(Duration::from_secs(interval_secs.max(1))).await;
-                continue;
+
+            let (up_ask, down_ask) = tokio::join!(
+                fetch_clob_best_ask(&market.up_token_id),
+                fetch_clob_best_ask(&market.down_token_id)
+            );
+            let up_val = up_ask.unwrap_or(Decimal::ZERO);
+            let down_val = down_ask.unwrap_or(Decimal::ZERO);
+
+            println!(
+                "btc_candle poll: up_ask={} down_ask={} threshold={} remaining={}s",
+                up_val, down_val, entry_threshold, close_ts - now
+            );
+
+            let (trigger_side, trigger_price, trigger_token) =
+                if up_val >= entry_threshold && up_val >= down_val {
+                    (poly2::Side::Yes, up_val, market.up_token_id.clone())
+                } else if down_val >= entry_threshold {
+                    (poly2::Side::No, down_val, market.down_token_id.clone())
+                } else {
+                    time::sleep(Duration::from_millis(poll_ms)).await;
+                    continue 'entry;
+                };
+
+            if trigger_price <= Decimal::ZERO {
+                time::sleep(Duration::from_millis(poll_ms)).await;
+                continue 'entry;
             }
-        };
-        println!("btc_candle: up_ask={} down_ask={}", up_ask, down_ask);
+            let size = (order_usd / trigger_price).round_dp(2);
+            println!(
+                "btc_candle: ENTRY triggered! side={:?} price={} size={} (order_usd={})",
+                trigger_side, trigger_price, size, order_usd
+            );
 
-        let (side, price) = if up_ask >= min_price && up_ask >= down_ask {
-            (poly2::Side::Yes, up_ask)
-        } else if down_ask >= min_price {
-            (poly2::Side::No, down_ask)
-        } else {
-            println!("btc_candle: skip (both asks below min_price={})", min_price);
-            time::sleep(Duration::from_secs(interval_secs.max(1))).await;
-            continue;
-        };
+            let signal = poly2::StrategySignal {
+                strategy_id: StrategyId::ProbabilityTrading,
+                market_id: market.market_id.clone(),
+                yes_token_id: Some(market.up_token_id.clone()),
+                no_token_id: Some(market.down_token_id.clone()),
+                actions: vec![poly2::OrderIntent {
+                    side: trigger_side.clone(),
+                    price: trigger_price,
+                    size,
+                    sell: false,
+                }],
+                state: poly2::StrategyState::Implemented,
+            };
 
-        if price <= Decimal::ZERO {
-            eprintln!("btc_candle: invalid price={}; skip", price);
-            time::sleep(Duration::from_secs(interval_secs.max(1))).await;
-            continue;
-        }
-        let size = order_usd / price;
-        println!(
-            "btc_candle: placing order side={:?} price={} size={} (order_usd={})",
-            side, price, size, order_usd
-        );
-
-        let _ = context;
-        let signal = poly2::StrategySignal {
-            // Reuse an existing StrategyId to avoid modifying the enum in this iteration.
-            strategy_id: StrategyId::ProbabilityTrading,
-            market_id: market.market_id.clone(),
-            yes_token_id: Some(market.up_token_id.clone()),
-            no_token_id: Some(market.down_token_id.clone()),
-            actions: vec![poly2::OrderIntent {
-                side,
-                price,
-                size,
-                sell: false,
-            }],
-            state: poly2::StrategyState::Implemented,
-        };
-
-        match execution.submit(&signal).await {
-            Ok(report) => print_execution_report(&report),
-            Err(err) => eprintln!("btc_candle: execution failed: {err}"),
+            match execution.submit(&signal).await {
+                Ok(report) => {
+                    print_execution_report(&report);
+                    bought_side = Some(trigger_side);
+                    bought_token_id = trigger_token;
+                    bought_size = size;
+                }
+                Err(err) => eprintln!("btc_candle: buy execution failed: {err}"),
+            }
+            break 'entry;
         }
 
-        time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+        // --- Phase 4: if we bought, monitor for stop-loss / take-profit ---
+        if let Some(ref exit_side) = bought_side {
+            println!(
+                "btc_candle: holding {:?}, monitoring stop_loss<={} / take_profit>={}",
+                exit_side, stop_loss_price, take_profit_price
+            );
+
+            'exit: loop {
+                let now = Utc::now().timestamp();
+                if now >= close_ts - 5 {
+                    println!("btc_candle: window closing, letting market resolve");
+                    break 'exit;
+                }
+
+                let (up_ask_res, down_ask_res) = tokio::join!(
+                    fetch_clob_best_ask(&market.up_token_id),
+                    fetch_clob_best_ask(&market.down_token_id)
+                );
+                let up_val = up_ask_res.unwrap_or(Decimal::ZERO);
+                let down_val = down_ask_res.unwrap_or(Decimal::ZERO);
+                let current_ask = if bought_token_id == market.up_token_id {
+                    up_val
+                } else {
+                    down_val
+                };
+
+                println!(
+                    "btc_candle exit: up_ask={} down_ask={} held_price={} SL={} TP={} remaining={}s",
+                    up_val, down_val, current_ask, stop_loss_price, take_profit_price, close_ts - now
+                );
+
+                let trigger = if current_ask <= stop_loss_price {
+                    println!("btc_candle: STOP LOSS triggered at {}", current_ask);
+                    true
+                } else if current_ask >= take_profit_price {
+                    println!("btc_candle: TAKE PROFIT triggered at {}", current_ask);
+                    true
+                } else {
+                    false
+                };
+
+                if trigger {
+                    let sell_price = fetch_clob_best_bid(&bought_token_id)
+                        .await
+                        .unwrap_or(current_ask);
+                    let sell_price = if sell_price > Decimal::ZERO {
+                        sell_price
+                    } else {
+                        current_ask
+                    };
+
+                    println!(
+                        "btc_candle: SELL side={:?} price={} size={}",
+                        exit_side, sell_price, bought_size
+                    );
+
+                    let signal = poly2::StrategySignal {
+                        strategy_id: StrategyId::ProbabilityTrading,
+                        market_id: market.market_id.clone(),
+                        yes_token_id: Some(market.up_token_id.clone()),
+                        no_token_id: Some(market.down_token_id.clone()),
+                        actions: vec![poly2::OrderIntent {
+                            side: exit_side.clone(),
+                            price: sell_price,
+                            size: bought_size,
+                            sell: true,
+                        }],
+                        state: poly2::StrategyState::Implemented,
+                    };
+
+                    match execution.submit(&signal).await {
+                        Ok(report) => print_execution_report(&report),
+                        Err(err) => eprintln!("btc_candle: sell execution failed: {err}"),
+                    }
+                    break 'exit;
+                }
+
+                time::sleep(Duration::from_millis(poll_ms)).await;
+            }
+        }
+
+        println!("btc_candle: round #{} complete", loop_idx);
     }
 }
 
@@ -726,262 +659,6 @@ async fn run_sdk_auth_export(dotenv_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_live_market_loop<C>(
-    execution_settings: &ExecutionSettings,
-    interval_secs: u64,
-    top_n: usize,
-    max_sum: Decimal,
-    min_edge: Decimal,
-    settle_guard_minutes: u64,
-    context: &StrategyContext,
-    runner: &mut EngineRunner<C>,
-    order_log_path: Option<&Path>,
-    positions_path: &Path,
-    dotenv_path: &Path,
-    preflight: &PreflightReport,
-) where
-    C: ExecutionClient,
-{
-    let mut loop_idx: u64 = 0;
-    let refresh_every = read_capital_refresh_loops(dotenv_path, 10);
-    let mut cached_capital = preflight.total_capital;
-    let mut cached_source = preflight.capital_source.clone();
-    let mut failure_breaker =
-        FailureCircuitBreaker::new(FailureCircuitBreakerConfig::from_env(dotenv_path));
-    let balance_check_wallet = resolve_runtime_var("PM_FUNDER", dotenv_path)
-        .or_else(|| resolve_runtime_var("PROXY_WALLET", dotenv_path));
-    let balance_check_rpc = resolve_runtime_var("RPC_URL", dotenv_path)
-        .unwrap_or_else(|| "https://poly.api.pocket.network".to_string());
-    let balance_check_usdc = resolve_runtime_var("USDC_CONTRACT_ADDRESS", dotenv_path)
-        .unwrap_or_else(|| "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".to_string());
-    let min_balance_usd = read_decimal_var(dotenv_path, "MIN_ORDER_SIZE_USD")
-        .unwrap_or_else(|| Decimal::ONE);
-    loop {
-        loop_idx += 1;
-        println!("\n================ loop_at={} ================", Utc::now().to_rfc3339());
-        let trading_enabled = read_trading_enabled(dotenv_path, preflight.trading_enabled);
-        if !trading_enabled {
-            failure_breaker.reset();
-        }
-        let breaker_open = trading_enabled && failure_breaker.is_open(loop_idx);
-        let mut loop_context = context.clone();
-        let mut loop_outcome = LoopOutcome::Neutral;
-        let mut balance_too_low = false;
-        if preflight.live_mode && trading_enabled {
-            let should_refresh = cached_capital.is_none() || loop_idx % refresh_every == 1;
-            if should_refresh {
-                match resolve_total_capital(dotenv_path) {
-                    Ok((capital, source)) => {
-                        cached_capital = Some(capital);
-                        cached_source = source;
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "capital refresh failed (loop={}): {}; trading skipped for safety",
-                            loop_idx, err
-                        );
-                    }
-                }
-            }
-            if let Some(capital) = cached_capital {
-                let mut effective_capital = capital;
-                if let Some(wallet) = &balance_check_wallet {
-                    match fetch_usdc_balance(&balance_check_rpc, &balance_check_usdc, wallet).await {
-                        Ok(onchain_balance) => {
-                            println!("onchain_usdc_balance={} wallet={}", onchain_balance, wallet);
-                            if onchain_balance < min_balance_usd {
-                                eprintln!(
-                                    "WARN insufficient USDC balance: {} < min {} — skipping execution",
-                                    onchain_balance, min_balance_usd
-                                );
-                                balance_too_low = true;
-                            }
-                            effective_capital = capital.min(onchain_balance);
-                        }
-                        Err(err) => {
-                            eprintln!("balance check failed: {err} — using configured capital");
-                        }
-                    }
-                }
-                loop_context.risk.total_capital = effective_capital;
-                println!("risk_total_capital={} source={}", effective_capital, cached_source);
-            }
-        }
-        match scan_arb_candidates(
-            execution_settings,
-            top_n,
-            max_sum,
-            min_edge,
-            settle_guard_minutes,
-        )
-        .await
-        {
-            Ok(candidates) => {
-                println!("scan_result_count={}", candidates.len());
-                for (idx, c) in candidates.iter().enumerate() {
-                    let volume_24h = c
-                        .volume_24h
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "n/a".to_string());
-                    println!(
-                        "scan #{:02}: edge={} sum={} pA={} pB={} vol24h={} slug={} question={}",
-                        idx + 1,
-                        c.edge,
-                        c.sum,
-                        c.price_a,
-                        c.price_b,
-                        volume_24h,
-                        c.market_slug,
-                        c.question
-                    );
-                }
-
-                let snapshots = to_market_snapshots(&candidates);
-                if snapshots.is_empty() {
-                    println!("no executable snapshots in this loop");
-                } else if !trading_enabled {
-                    println!("trading_enabled=false: skip order execution, scan only");
-                } else if balance_too_low {
-                    eprintln!("SKIP execution: USDC balance too low to place orders");
-                } else if breaker_open {
-                    eprintln!(
-                        "ALERT circuit breaker open: skip execution at loop={}; close_at_loop={}",
-                        loop_idx,
-                        failure_breaker.open_until_loop().unwrap_or(loop_idx)
-                    );
-                } else {
-                    let summary = runner
-                        .run_snapshots_with_report_hook(snapshots, &loop_context, |report| {
-                            print_execution_report(report);
-                            if let Some(path) = order_log_path {
-                                let _ = append_order_record(path, report);
-                            }
-                        })
-                        .await;
-                    match summary {
-                        Ok(s) => {
-                            println!(
-                                "order_summary: processed_snapshots={}, reports={}, skipped_cooldown={}, realized_notional={}, fees={}, unrealized_pnl={}",
-                                s.processed_snapshots,
-                                s.execution_reports,
-                                s.skipped_cooldown,
-                                s.realized_notional,
-                                s.total_fees,
-                                s.unrealized_pnl
-                            );
-                            println!(
-                                "tracked_markets={}",
-                                runner.position_manager().positions().len()
-                            );
-                            let mut forced_exit_error = false;
-                            let open_market_ids = runner.position_manager().open_market_ids();
-                            if !open_market_ids.is_empty() {
-                                match fetch_market_snapshots_by_ids(execution_settings, &open_market_ids).await {
-                                    Ok(forced_snapshots) => {
-                                        if !forced_snapshots.is_empty() {
-                                            println!(
-                                                "forced_quote_poll: held_markets={}, quoted_markets={}",
-                                                open_market_ids.len(),
-                                                forced_snapshots.len()
-                                            );
-                                            let forced_marks: HashMap<String, (Decimal, Decimal, Decimal, Decimal)> =
-                                                forced_snapshots
-                                                    .iter()
-                                                    .map(|s| {
-                                                        (
-                                                            s.market_id.clone(),
-                                                            (
-                                                                s.yes_best_bid,
-                                                                s.yes_best_ask,
-                                                                s.no_best_bid,
-                                                                s.no_best_ask,
-                                                            ),
-                                                        )
-                                                    })
-                                                    .collect();
-                                            match runner
-                                                .run_forced_exit_checks_with_report_hook(&forced_marks, |report| {
-                                                    print_execution_report(report);
-                                                    if let Some(path) = order_log_path {
-                                                        let _ = append_order_record(path, report);
-                                                    }
-                                                })
-                                                .await
-                                            {
-                                                Ok(forced_exit_reports) => {
-                                                    if forced_exit_reports > 0 {
-                                                        println!(
-                                                            "forced_exit_reports={} (held-market quote poll)",
-                                                            forced_exit_reports
-                                                        );
-                                                    }
-                                                }
-                                                Err(err) => {
-                                                    eprintln!("forced exit checks failed: {err}");
-                                                    forced_exit_error = true;
-                                                }
-                                            }
-                                        } else {
-                                            println!(
-                                                "forced_quote_poll: held_markets={} but no executable quotes found",
-                                                open_market_ids.len()
-                                            );
-                                        }
-                                    }
-                                    Err(err) => {
-                                        eprintln!("forced quote poll failed: {err}");
-                                    }
-                                }
-                            }
-                            if let Err(e) = save_positions(positions_path, runner.position_manager()) {
-                                eprintln!("persist positions failed: {}", e);
-                                loop_outcome = LoopOutcome::Failure;
-                            } else {
-                                loop_outcome = if forced_exit_error {
-                                    LoopOutcome::Failure
-                                } else {
-                                    LoopOutcome::Success
-                                };
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("engine execute failed: {err}");
-                            loop_outcome = LoopOutcome::Failure;
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("market scan failed: {err}");
-                loop_outcome = LoopOutcome::Failure;
-            }
-        }
-        if trading_enabled {
-            if let Some(alert) = failure_breaker.observe(loop_outcome, loop_idx) {
-                eprintln!("ALERT {}", alert);
-            }
-        }
-        time::sleep(Duration::from_secs(interval_secs.max(1))).await;
-    }
-}
-
-fn to_market_snapshots(candidates: &[poly2::ArbCandidate]) -> Vec<MarketSnapshot> {
-    candidates
-        .iter()
-        .map(|c| MarketSnapshot {
-            market_id: c.market_id.clone(),
-            yes_token_id: Some(c.yes_token_id.clone()),
-            no_token_id: Some(c.no_token_id.clone()),
-            yes_best_bid: c.bid_a,
-            yes_best_ask: c.price_a,
-            no_best_bid: c.bid_b,
-            no_best_ask: c.price_b,
-            volume_24h: c.volume_24h,
-            timestamp: Utc::now(),
-        })
-        .collect()
-}
-
 fn print_execution_report(report: &ExecutionReport) {
     println!(
         "order_report: market_id={}, status={:?}, action_count={}, order_ids={:?}",
@@ -1087,209 +764,6 @@ fn read_scan_top_n(dotenv_path: &Path, default_top_n: usize) -> usize {
         }
     }
     default_top_n.max(1)
-}
-
-fn read_trade_cooldown_secs(dotenv_path: &Path, default_secs: u64) -> u64 {
-    let Ok(raw) = std::fs::read_to_string(dotenv_path) else {
-        return default_secs;
-    };
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((k, v)) = trimmed.split_once('=') else {
-            continue;
-        };
-        if k.trim() != "TRADE_COOLDOWN_SECS" {
-            continue;
-        }
-        if let Ok(sec) = v.trim().parse::<u64>() {
-            return sec;
-        }
-    }
-    default_secs
-}
-
-fn read_take_profit_pct(dotenv_path: &Path) -> Option<Decimal> {
-    let Ok(raw) = std::fs::read_to_string(dotenv_path) else {
-        return None;
-    };
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((k, v)) = trimmed.split_once('=') else {
-            continue;
-        };
-        if k.trim() != "TAKE_PROFIT_PCT" {
-            continue;
-        }
-        if let Ok(p) = Decimal::from_str(v.trim()) {
-            return Some(p);
-        }
-    }
-    None
-}
-
-fn read_stop_loss_pct(dotenv_path: &Path) -> Option<Decimal> {
-    let Ok(raw) = std::fs::read_to_string(dotenv_path) else {
-        return None;
-    };
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((k, v)) = trimmed.split_once('=') else {
-            continue;
-        };
-        if k.trim() != "STOP_LOSS_PCT" {
-            continue;
-        }
-        if let Ok(p) = Decimal::from_str(v.trim()) {
-            return Some(p);
-        }
-    }
-    None
-}
-
-#[derive(Clone, Debug)]
-struct FailureCircuitBreakerConfig {
-    consecutive_failure_limit: u64,
-    window_loops: usize,
-    max_failure_rate: f64,
-    cooldown_loops: u64,
-}
-
-impl FailureCircuitBreakerConfig {
-    fn from_env(dotenv_path: &Path) -> Self {
-        let consecutive_failure_limit = resolve_runtime_var("CB_CONSECUTIVE_FAILURE_LIMIT", dotenv_path)
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(3)
-            .max(1);
-        let window_loops = resolve_runtime_var("CB_WINDOW_LOOPS", dotenv_path)
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(20)
-            .max(1);
-        let max_failure_rate = resolve_runtime_var("CB_MAX_FAILURE_RATE", dotenv_path)
-            .and_then(|v| v.trim().parse::<f64>().ok())
-            .map(|v| v.clamp(0.0, 1.0))
-            .unwrap_or(0.5);
-        let cooldown_loops = resolve_runtime_var("CB_COOLDOWN_LOOPS", dotenv_path)
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(5)
-            .max(1);
-        Self {
-            consecutive_failure_limit,
-            window_loops,
-            max_failure_rate,
-            cooldown_loops,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-enum LoopOutcome {
-    Success,
-    Failure,
-    Neutral,
-}
-
-#[derive(Clone, Debug)]
-struct FailureCircuitBreaker {
-    config: FailureCircuitBreakerConfig,
-    consecutive_failures: u64,
-    recent_failures: VecDeque<bool>,
-    open_until_loop: Option<u64>,
-}
-
-impl FailureCircuitBreaker {
-    fn new(config: FailureCircuitBreakerConfig) -> Self {
-        Self {
-            config,
-            consecutive_failures: 0,
-            recent_failures: VecDeque::new(),
-            open_until_loop: None,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.consecutive_failures = 0;
-        self.recent_failures.clear();
-        self.open_until_loop = None;
-    }
-
-    fn is_open(&self, loop_idx: u64) -> bool {
-        self.open_until_loop.is_some_and(|until| loop_idx <= until)
-    }
-
-    fn open_until_loop(&self) -> Option<u64> {
-        self.open_until_loop
-    }
-
-    fn observe(&mut self, outcome: LoopOutcome, loop_idx: u64) -> Option<String> {
-        match outcome {
-            LoopOutcome::Neutral => return None,
-            LoopOutcome::Success => {
-                self.consecutive_failures = 0;
-                self.record_failure_flag(false);
-                if self.open_until_loop.is_some() {
-                    self.open_until_loop = None;
-                    return Some("circuit breaker closed after successful loop".to_string());
-                }
-                return None;
-            }
-            LoopOutcome::Failure => {
-                self.consecutive_failures += 1;
-                self.record_failure_flag(true);
-            }
-        }
-
-        if self.open_until_loop.is_some_and(|until| loop_idx <= until) {
-            return None;
-        }
-
-        if self.consecutive_failures >= self.config.consecutive_failure_limit {
-            let until = loop_idx + self.config.cooldown_loops;
-            self.open_until_loop = Some(until);
-            return Some(format!(
-                "circuit breaker opened: consecutive_failures={} threshold={} cooldown_loops={} close_at_loop={}",
-                self.consecutive_failures,
-                self.config.consecutive_failure_limit,
-                self.config.cooldown_loops,
-                until
-            ));
-        }
-
-        let window_size = self.recent_failures.len();
-        if window_size >= self.config.window_loops {
-            let failures = self.recent_failures.iter().filter(|v| **v).count();
-            let failure_rate = failures as f64 / window_size as f64;
-            if failure_rate >= self.config.max_failure_rate {
-                let until = loop_idx + self.config.cooldown_loops;
-                self.open_until_loop = Some(until);
-                return Some(format!(
-                    "circuit breaker opened: failure_rate={:.2} threshold={:.2} window={} cooldown_loops={} close_at_loop={}",
-                    failure_rate,
-                    self.config.max_failure_rate,
-                    window_size,
-                    self.config.cooldown_loops,
-                    until
-                ));
-            }
-        }
-
-        None
-    }
-
-    fn record_failure_flag(&mut self, is_failure: bool) {
-        self.recent_failures.push_back(is_failure);
-        while self.recent_failures.len() > self.config.window_loops {
-            self.recent_failures.pop_front();
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1414,13 +888,6 @@ fn resolve_total_capital(dotenv_path: &Path) -> anyhow::Result<(Decimal, String)
     Err(anyhow!(
         "missing capital source: set TOTAL_CAPITAL_USD or TOTAL_CAPITAL_CMD"
     ))
-}
-
-fn read_capital_refresh_loops(dotenv_path: &Path, default_loops: u64) -> u64 {
-    resolve_runtime_var("CAPITAL_REFRESH_LOOPS", dotenv_path)
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(default_loops)
-        .max(1)
 }
 
 fn read_trading_enabled(dotenv_path: &Path, default_value: bool) -> bool {
