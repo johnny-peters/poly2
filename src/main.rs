@@ -17,10 +17,10 @@ use std::sync::Arc;
 use tokio::time::{self, Duration};
 
 use poly2::{
-    append_order_record, fetch_market_snapshots_by_ids, load_positions, run_healthcheck,
-    save_positions, scan_arb_candidates, AppConfig, ArbitrageStrategy, EngineRunner,
-    ExecutionClient, ExecutionReport, ExecutionSettings, MarketSnapshot, MockExecutionClient,
-    RetryingExecutionClient, RiskContext, RiskEngine,
+    append_order_record, fetch_market_snapshots_by_ids, fetch_usdc_balance, load_positions,
+    run_healthcheck, save_positions, scan_arb_candidates, AppConfig, ArbitrageStrategy,
+    EngineRunner, ExecutionClient, ExecutionReport, ExecutionSettings, MarketSnapshot,
+    MockExecutionClient, RetryingExecutionClient, RiskContext, RiskEngine,
     PolymarketSdkExecutionClient, StrategyContext, StrategyId, StrategyRegistry, TodoStrategy,
     TradingEngine,
 };
@@ -462,6 +462,14 @@ async fn run_live_market_loop<C>(
     let mut cached_source = preflight.capital_source.clone();
     let mut failure_breaker =
         FailureCircuitBreaker::new(FailureCircuitBreakerConfig::from_env(dotenv_path));
+    let balance_check_wallet = resolve_runtime_var("PM_FUNDER", dotenv_path)
+        .or_else(|| resolve_runtime_var("PROXY_WALLET", dotenv_path));
+    let balance_check_rpc = resolve_runtime_var("RPC_URL", dotenv_path)
+        .unwrap_or_else(|| "https://poly.api.pocket.network".to_string());
+    let balance_check_usdc = resolve_runtime_var("USDC_CONTRACT_ADDRESS", dotenv_path)
+        .unwrap_or_else(|| "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".to_string());
+    let min_balance_usd = read_decimal_var(dotenv_path, "MIN_ORDER_SIZE_USD")
+        .unwrap_or_else(|| Decimal::ONE);
     loop {
         loop_idx += 1;
         println!("\n================ loop_at={} ================", Utc::now().to_rfc3339());
@@ -472,6 +480,7 @@ async fn run_live_market_loop<C>(
         let breaker_open = trading_enabled && failure_breaker.is_open(loop_idx);
         let mut loop_context = context.clone();
         let mut loop_outcome = LoopOutcome::Neutral;
+        let mut balance_too_low = false;
         if preflight.live_mode && trading_enabled {
             let should_refresh = cached_capital.is_none() || loop_idx % refresh_every == 1;
             if should_refresh {
@@ -489,8 +498,27 @@ async fn run_live_market_loop<C>(
                 }
             }
             if let Some(capital) = cached_capital {
-                loop_context.risk.total_capital = capital;
-                println!("risk_total_capital={} source={}", capital, cached_source);
+                let mut effective_capital = capital;
+                if let Some(wallet) = &balance_check_wallet {
+                    match fetch_usdc_balance(&balance_check_rpc, &balance_check_usdc, wallet).await {
+                        Ok(onchain_balance) => {
+                            println!("onchain_usdc_balance={} wallet={}", onchain_balance, wallet);
+                            if onchain_balance < min_balance_usd {
+                                eprintln!(
+                                    "WARN insufficient USDC balance: {} < min {} — skipping execution",
+                                    onchain_balance, min_balance_usd
+                                );
+                                balance_too_low = true;
+                            }
+                            effective_capital = capital.min(onchain_balance);
+                        }
+                        Err(err) => {
+                            eprintln!("balance check failed: {err} — using configured capital");
+                        }
+                    }
+                }
+                loop_context.risk.total_capital = effective_capital;
+                println!("risk_total_capital={} source={}", effective_capital, cached_source);
             }
         }
         match scan_arb_candidates(
@@ -527,6 +555,8 @@ async fn run_live_market_loop<C>(
                     println!("no executable snapshots in this loop");
                 } else if !trading_enabled {
                     println!("trading_enabled=false: skip order execution, scan only");
+                } else if balance_too_low {
+                    eprintln!("SKIP execution: USDC balance too low to place orders");
                 } else if breaker_open {
                     eprintln!(
                         "ALERT circuit breaker open: skip execution at loop={}; close_at_loop={}",

@@ -593,6 +593,46 @@ async fn check_latest_block(rpc_url: &str) -> Result<String> {
     Ok(format!("latest_block={block_hex}"))
 }
 
+/// Query ERC20 `balanceOf(wallet)` via `eth_call` and return the human-readable decimal value
+/// (raw uint256 divided by 10^`decimals`).
+pub async fn fetch_erc20_balance(
+    rpc_url: &str,
+    contract: &str,
+    wallet: &str,
+    decimals: u32,
+) -> Result<Decimal> {
+    let wallet_clean = wallet.trim().trim_start_matches("0x");
+    let data = format!("0x70a08231{:0>64}", wallet_clean);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": contract, "data": data}, "latest"],
+        "id": 42
+    });
+    let resp = reqwest::Client::new()
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .context("erc20 balanceOf rpc request failed")?
+        .json::<JsonRpcResp>()
+        .await
+        .context("erc20 balanceOf rpc parse failed")?;
+    let hex = resp
+        .result
+        .ok_or_else(|| anyhow!("erc20 balanceOf: missing result"))?;
+    let hex_clean = hex.trim().trim_start_matches("0x");
+    let raw = u128::from_str_radix(hex_clean, 16)
+        .with_context(|| format!("erc20 balanceOf: invalid hex '{hex_clean}'"))?;
+    let divisor = Decimal::from(10u64.pow(decimals));
+    Ok(Decimal::from(raw) / divisor)
+}
+
+/// Convenience wrapper: query USDC (6-decimal) balance for a wallet.
+pub async fn fetch_usdc_balance(rpc_url: &str, usdc_contract: &str, wallet: &str) -> Result<Decimal> {
+    fetch_erc20_balance(rpc_url, usdc_contract, wallet, 6).await
+}
+
 async fn check_contract_code(rpc_url: &str, contract: &str) -> Result<String> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
