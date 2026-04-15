@@ -15,6 +15,16 @@ use std::time::{Duration, Instant};
 use crate::config::ExecutionSettings;
 
 #[derive(Clone, Debug)]
+pub struct BtcCandleMarket {
+    pub market_id: String,
+    pub market_slug: String,
+    /// Map "Up" outcome token -> StrategySignal.yes_token_id
+    pub up_token_id: String,
+    /// Map "Down" outcome token -> StrategySignal.no_token_id
+    pub down_token_id: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct CheckItem {
     pub name: String,
     pub ok: bool,
@@ -200,6 +210,119 @@ pub async fn scan_arb_candidates(
         out.len()
     );
     Ok(out)
+}
+
+pub async fn discover_btc_candle_market(epoch_ts: i64) -> Result<BtcCandleMarket> {
+    let mut offsets = vec![0_i64, -300, 300];
+    offsets.dedup();
+    for off in offsets {
+        let candidate_ts = epoch_ts + off;
+        let slug = format!("btc-updown-5m-{candidate_ts}");
+        if let Ok(market) = discover_btc_candle_market_by_slug(&slug).await {
+            return Ok(market);
+        }
+    }
+    Err(anyhow!(
+        "failed to discover btc 5m market for epoch_ts={} (tried offsets 0,-300,+300)",
+        epoch_ts
+    ))
+}
+
+async fn discover_btc_candle_market_by_slug(slug: &str) -> Result<BtcCandleMarket> {
+    let url = format!("https://gamma-api.polymarket.com/events?slug={slug}");
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build http client")?;
+    let resp = http.get(&url).send().await.context("gamma events request failed")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("gamma events request failed: status={}", resp.status()));
+    }
+    let root: Value = resp.json().await.context("failed to parse gamma events json")?;
+    let arr = root
+        .as_array()
+        .ok_or_else(|| anyhow!("gamma events response is not an array"))?;
+    let first = arr.first().ok_or_else(|| anyhow!("gamma events returned no results"))?;
+    let markets = first
+        .get("markets")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("gamma event missing markets array"))?;
+    let market = markets
+        .first()
+        .ok_or_else(|| anyhow!("gamma event has empty markets"))?;
+
+    let market_id = extract_stable_market_id(market);
+
+    let outcomes = market
+        .get("outcomes")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let token_ids = extract_clob_token_ids_vec(market)
+        .context("missing/invalid clobTokenIds for btc candle market")?;
+    if token_ids.len() < 2 {
+        return Err(anyhow!("btc candle market: clobTokenIds length < 2"));
+    }
+
+    let (up_idx, down_idx) = resolve_up_down_indices(&outcomes).unwrap_or((0_usize, 1_usize));
+    if up_idx >= token_ids.len() || down_idx >= token_ids.len() {
+        return Err(anyhow!(
+            "btc candle market: outcome indices out of bounds (up_idx={}, down_idx={}, token_ids_len={})",
+            up_idx,
+            down_idx,
+            token_ids.len()
+        ));
+    }
+
+    Ok(BtcCandleMarket {
+        market_id,
+        market_slug: slug.to_string(),
+        up_token_id: token_ids[up_idx].clone(),
+        down_token_id: token_ids[down_idx].clone(),
+    })
+}
+
+fn resolve_up_down_indices(outcomes: &[String]) -> Option<(usize, usize)> {
+    let mut up: Option<usize> = None;
+    let mut down: Option<usize> = None;
+    for (i, o) in outcomes.iter().enumerate() {
+        let n = o.to_ascii_lowercase();
+        if up.is_none()
+            && (n == "up" || n.contains("higher") || n.contains("up "))
+        {
+            up = Some(i);
+        }
+        if down.is_none()
+            && (n == "down" || n.contains("lower") || n.contains("down "))
+        {
+            down = Some(i);
+        }
+    }
+    match (up, down) {
+        (Some(u), Some(d)) if u != d => Some((u, d)),
+        _ => None,
+    }
+}
+
+fn extract_clob_token_ids_vec(market: &Value) -> Option<Vec<String>> {
+    let raw = market.get("clobTokenIds")?;
+    if let Some(arr) = raw.as_array() {
+        let ids: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(ToString::to_string))
+            .collect();
+        return if ids.is_empty() { None } else { Some(ids) };
+    }
+    if let Some(s) = raw.as_str() {
+        return serde_json::from_str::<Vec<String>>(s).ok().filter(|v| !v.is_empty());
+    }
+    None
 }
 
 /// Force-poll executable quotes for specific market ids (used by exit checks on held positions).

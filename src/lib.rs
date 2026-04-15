@@ -20,8 +20,8 @@ pub use execution::{
 pub use persistence::{append_order_record, load_positions, save_positions, OrderRecord, PositionSnapshot};
 pub use position::{PositionManager, PositionPnl};
 pub use healthcheck::{
-    fetch_market_snapshots_by_ids, fetch_usdc_balance, run_healthcheck, scan_arb_candidates,
-    ArbCandidate, CheckItem, HealthcheckReport,
+    discover_btc_candle_market, fetch_market_snapshots_by_ids, fetch_usdc_balance, run_healthcheck,
+    scan_arb_candidates, ArbCandidate, BtcCandleMarket, CheckItem, HealthcheckReport,
 };
 pub use risk::{RiskConfig, RiskEngine};
 pub use runner::{EngineRunner, RunSummary, RunnerConfig};

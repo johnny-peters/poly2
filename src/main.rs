@@ -17,16 +17,354 @@ use std::sync::Arc;
 use tokio::time::{self, Duration};
 
 use poly2::{
-    append_order_record, fetch_market_snapshots_by_ids, fetch_usdc_balance, load_positions,
+    append_order_record, fetch_market_snapshots_by_ids, fetch_usdc_balance,
     run_healthcheck, save_positions, scan_arb_candidates, AppConfig, ArbitrageStrategy,
     EngineRunner, ExecutionClient, ExecutionReport, ExecutionSettings, MarketSnapshot,
     MockExecutionClient, RetryingExecutionClient, RiskContext, RiskEngine,
     PolymarketSdkExecutionClient, StrategyContext, StrategyId, StrategyRegistry, TodoStrategy,
-    TradingEngine,
+    TradingEngine, discover_btc_candle_market,
 };
+
+async fn fetch_clob_best_ask(token_id: &str) -> anyhow::Result<Decimal> {
+    let url = format!(
+        "https://clob.polymarket.com/price?token_id={}&side=buy",
+        token_id.trim()
+    );
+    let resp = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(10))
+        .build()?
+        .get(url)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!("clob price failed: status={}", resp.status()));
+    }
+    let root: serde_json::Value = resp.json().await?;
+    let raw = root
+        .get("price")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("clob price missing 'price' field"))?;
+    Ok(Decimal::from_str(raw.trim())?)
+}
+
+/// Spawn a background task that maintains a persistent Polymarket RTDS WebSocket
+/// connection, continuously updating the latest Chainlink BTC/USD price.
+/// Returns a `watch::Receiver<Option<Decimal>>` that always holds the freshest price.
+fn spawn_rtds_btc_price_feed() -> tokio::sync::watch::Receiver<Option<Decimal>> {
+    let (tx, rx) = tokio::sync::watch::channel(None::<Decimal>);
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = rtds_btc_price_loop(&tx).await {
+                eprintln!("RTDS feed error: {e} — reconnecting in 3s");
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    });
+    rx
+}
+
+async fn rtds_btc_price_loop(
+    tx: &tokio::sync::watch::Sender<Option<Decimal>>,
+) -> anyhow::Result<()> {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async("wss://ws-live-data.polymarket.com")
+        .await
+        .context("RTDS WebSocket connect failed")?;
+    println!("RTDS: connected to wss://ws-live-data.polymarket.com");
+
+    let sub_msg = serde_json::json!({
+        "action": "subscribe",
+        "subscriptions": [{
+            "topic": "crypto_prices_chainlink",
+            "type": "*",
+            "filters": "{\"symbol\":\"btc/usd\"}"
+        }]
+    });
+    ws.send(Message::Text(sub_msg.to_string().into()))
+        .await
+        .context("RTDS subscribe send failed")?;
+
+    let mut last_ping = tokio::time::Instant::now();
+    let ping_interval = Duration::from_secs(5);
+
+    loop {
+        let msg = tokio::select! {
+            m = ws.next() => match m {
+                Some(Ok(m)) => m,
+                Some(Err(e)) => return Err(anyhow!("RTDS ws read error: {e}")),
+                None => return Err(anyhow!("RTDS ws closed")),
+            },
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                return Err(anyhow!("RTDS ws: no message for 30s"));
+            }
+        };
+
+        if last_ping.elapsed() >= ping_interval {
+            let _ = ws.send(Message::text("PING")).await;
+            last_ping = tokio::time::Instant::now();
+        }
+
+        let text = match &msg {
+            Message::Text(t) => t.clone(),
+            Message::Ping(d) => {
+                let _ = ws.send(Message::Pong(d.clone())).await;
+                continue;
+            }
+            _ => continue,
+        };
+
+        let val: serde_json::Value = match serde_json::from_str(text.as_ref()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if val.get("topic").and_then(|t| t.as_str()) != Some("crypto_prices_chainlink") {
+            continue;
+        }
+        if let Some(payload) = val.get("payload") {
+            if payload.get("symbol").and_then(|s| s.as_str()) == Some("btc/usd") {
+                if let Some(price_f64) = payload.get("value").and_then(|v| v.as_f64()) {
+                    let price_str = format!("{:.2}", price_f64);
+                    if let Ok(price) = Decimal::from_str(&price_str) {
+                        tx.send_replace(Some(price));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Read the latest BTC/USD price from the persistent RTDS feed.
+/// Waits up to `timeout_secs` for a valid price if none is available yet.
+async fn read_btc_price(
+    rx: &mut tokio::sync::watch::Receiver<Option<Decimal>>,
+    timeout_secs: u64,
+) -> anyhow::Result<Decimal> {
+    if let Some(p) = *rx.borrow() {
+        return Ok(p);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        tokio::select! {
+            res = rx.changed() => {
+                res.map_err(|_| anyhow!("RTDS feed channel closed"))?;
+                if let Some(p) = *rx.borrow() {
+                    return Ok(p);
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(anyhow!("RTDS price not available after {timeout_secs}s"));
+            }
+        }
+    }
+}
+
+fn read_decimal_env_or(dotenv_path: &Path, key: &str, default_value: Decimal) -> Decimal {
+    resolve_runtime_var(key, dotenv_path)
+        .and_then(|v| Decimal::from_str(v.trim()).ok())
+        .unwrap_or(default_value)
+}
+
+fn read_u64_env_or(dotenv_path: &Path, key: &str, default_value: u64) -> u64 {
+    resolve_runtime_var(key, dotenv_path)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default_value)
+}
+
+async fn run_btc_candle_loop<C>(
+    interval_secs: u64,
+    context: &StrategyContext,
+    execution: &C,
+    dotenv_path: &Path,
+) where
+    C: ExecutionClient,
+{
+    let order_usd = read_decimal_env_or(dotenv_path, "BTC_CANDLE_ORDER_USD", Decimal::from(2_u32));
+    let min_price = read_decimal_env_or(
+        dotenv_path,
+        "BTC_CANDLE_MIN_PRICE",
+        Decimal::from_str("0.85").unwrap_or(Decimal::from(85_u32) / Decimal::from(100_u32)),
+    );
+    let entry_before_close_secs =
+        read_u64_env_or(dotenv_path, "BTC_CANDLE_ENTRY_BEFORE_CLOSE_SECS", 30).min(299);
+    let min_abs_diff = read_decimal_env_or(
+        dotenv_path,
+        "BTC_CANDLE_MIN_ABS_DIFF",
+        Decimal::from(30_u32),
+    );
+
+    println!(
+        "btc_candle: order_usd={}, min_price={}, entry_before_close_secs={}, min_abs_diff={}",
+        order_usd, min_price, entry_before_close_secs, min_abs_diff
+    );
+
+    let mut price_rx = spawn_rtds_btc_price_feed();
+
+    // Wait for the first price to arrive before entering the loop
+    match read_btc_price(&mut price_rx, 30).await {
+        Ok(p) => println!("RTDS: initial BTC/USD price = {}", p),
+        Err(e) => eprintln!("RTDS: warning, initial price not yet available: {e}"),
+    }
+
+    let mut _loop_idx: u64 = 0;
+    loop {
+        _loop_idx += 1;
+
+        // --- Phase 1: sleep until the NEXT 5-min window boundary ---
+        let now_secs = Utc::now().timestamp();
+        let current_window = now_secs - (now_secs.rem_euclid(300));
+        let next_window = current_window + 300;
+        let sleep_to_boundary = (next_window - now_secs).max(0) as u64;
+        println!(
+            "\n================ btc5m waiting for window boundary ================\n\
+             now={} next_window_ts={} sleeping={}s",
+            Utc::now().to_rfc3339(),
+            next_window,
+            sleep_to_boundary
+        );
+        if sleep_to_boundary > 0 {
+            time::sleep(Duration::from_secs(sleep_to_boundary)).await;
+        }
+
+        // --- Phase 2: at window boundary, capture Price to Beat ---
+        let window_ts = next_window;
+        let close_ts = window_ts + 300;
+        let entry_ts = close_ts - (entry_before_close_secs as i64);
+
+        let price_to_beat = match read_btc_price(&mut price_rx, 10).await {
+            Ok(p) => {
+                println!(
+                    "window_ts={} close_ts={} price_to_beat(chainlink)={} captured_at={}",
+                    window_ts, close_ts, p, Utc::now().to_rfc3339()
+                );
+                p
+            }
+            Err(err) => {
+                eprintln!(
+                    "RTDS price_to_beat unavailable at window boundary: {err}"
+                );
+                time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+                continue;
+            }
+        };
+
+        // --- Phase 3: sleep until T-30s before close ---
+        let now_secs2 = Utc::now().timestamp();
+        if now_secs2 < entry_ts {
+            let sleep_for = (entry_ts - now_secs2) as u64;
+            println!("btc_candle: sleeping {}s until entry_ts={}", sleep_for, entry_ts);
+            time::sleep(Duration::from_secs(sleep_for)).await;
+        }
+
+        // --- Phase 4: read current price instantly from live feed ---
+        let current_price = match read_btc_price(&mut price_rx, 10).await {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("btc_candle: RTDS current_price unavailable: {err}");
+                time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+                continue;
+            }
+        };
+        let abs_diff = (price_to_beat - current_price).abs();
+        println!(
+            "btc_candle: price_to_beat={} current_price={} abs_diff={}",
+            price_to_beat, current_price, abs_diff
+        );
+        if abs_diff < min_abs_diff {
+            println!(
+                "btc_candle: skip (|a-b|={} < min_abs_diff={})",
+                abs_diff, min_abs_diff
+            );
+            time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+            continue;
+        }
+
+        // --- Phase 5: discover market & check odds ---
+        let market = match discover_btc_candle_market(window_ts).await {
+            Ok(m) => m,
+            Err(err) => {
+                eprintln!("btc_candle: market discovery failed: {err}");
+                time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+                continue;
+            }
+        };
+        println!(
+            "btc_candle: market_id={} slug={} up_token_id={} down_token_id={}",
+            market.market_id, market.market_slug, market.up_token_id, market.down_token_id
+        );
+
+        let up_ask = match fetch_clob_best_ask(&market.up_token_id).await {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("btc_candle: fetch up ask failed: {err}");
+                time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+                continue;
+            }
+        };
+        let down_ask = match fetch_clob_best_ask(&market.down_token_id).await {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("btc_candle: fetch down ask failed: {err}");
+                time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+                continue;
+            }
+        };
+        println!("btc_candle: up_ask={} down_ask={}", up_ask, down_ask);
+
+        let (side, price) = if up_ask >= min_price && up_ask >= down_ask {
+            (poly2::Side::Yes, up_ask)
+        } else if down_ask >= min_price {
+            (poly2::Side::No, down_ask)
+        } else {
+            println!("btc_candle: skip (both asks below min_price={})", min_price);
+            time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+            continue;
+        };
+
+        if price <= Decimal::ZERO {
+            eprintln!("btc_candle: invalid price={}; skip", price);
+            time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+            continue;
+        }
+        let size = order_usd / price;
+        println!(
+            "btc_candle: placing order side={:?} price={} size={} (order_usd={})",
+            side, price, size, order_usd
+        );
+
+        let _ = context;
+        let signal = poly2::StrategySignal {
+            // Reuse an existing StrategyId to avoid modifying the enum in this iteration.
+            strategy_id: StrategyId::ProbabilityTrading,
+            market_id: market.market_id.clone(),
+            yes_token_id: Some(market.up_token_id.clone()),
+            no_token_id: Some(market.down_token_id.clone()),
+            actions: vec![poly2::OrderIntent {
+                side,
+                price,
+                size,
+                sell: false,
+            }],
+            state: poly2::StrategyState::Implemented,
+        };
+
+        match execution.submit(&signal).await {
+            Ok(report) => print_execution_report(&report),
+            Err(err) => eprintln!("btc_candle: execution failed: {err}"),
+        }
+
+        time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::ring::default_provider(),
+    );
     let args: Vec<String> = std::env::args().collect();
     let dotenv_path = Path::new("src/.env");
     let app_config = AppConfig::load_from_path_with_env_overlay(
@@ -123,8 +461,8 @@ async fn main() -> anyhow::Result<()> {
     registry.register(Arc::new(TodoStrategy::new(StrategyId::MarketMaking)));
     registry.register(Arc::new(TodoStrategy::new(StrategyId::LatencyArbitrage)));
 
-    let risk_engine = RiskEngine::new(app_config.risk_config()?);
-    let engine = TradingEngine::new(registry, risk_engine);
+    let _risk_engine = RiskEngine::new(app_config.risk_config()?);
+    let _engine = TradingEngine::new(registry, _risk_engine);
 
     let execution_settings = app_config.execution_settings();
     println!(
@@ -186,39 +524,7 @@ async fn main() -> anyhow::Result<()> {
             execution_settings.max_retries,
             execution_settings.timeout_secs * 100,
         );
-        let trade_cooldown_secs = read_trade_cooldown_secs(Path::new("src/.env"), 300);
-        let take_profit_pct = read_take_profit_pct(Path::new("src/.env"));
-        let stop_loss_pct = read_stop_loss_pct(Path::new("src/.env"));
-        println!("trade_cooldown_secs={} (same market skip re-trade)", trade_cooldown_secs);
-        if let Some(p) = take_profit_pct {
-            println!("take_profit_pct={} (close when unrealized PnL % >= this)", p);
-        }
-        if let Some(p) = stop_loss_pct {
-            println!("stop_loss_pct={} (close when unrealized PnL % <= -this)", p);
-        }
-        let order_log_path = std::env::var("ORDER_LOG_PATH").ok().map(std::path::PathBuf::from);
-        let positions_path = std::env::var("POSITIONS_PATH").ok().map(std::path::PathBuf::from);
-        let positions_path_ref = positions_path.as_deref().unwrap_or(Path::new("data/positions.json"));
-        let mut runner = EngineRunner::new(engine, retrying)
-            .with_trade_cooldown_secs(trade_cooldown_secs)
-            .with_take_profit_pct(take_profit_pct)
-            .with_stop_loss_pct(stop_loss_pct)
-            .with_position_manager(load_positions(positions_path_ref));
-        run_live_market_loop(
-            &execution_settings,
-            fetch_interval_secs,
-            scan_top_n,
-            scan_max_sum,
-            scan_min_edge,
-            scan_settle_guard_minutes,
-            &context,
-            &mut runner,
-            order_log_path.as_deref(),
-            positions_path_ref,
-            dotenv_path,
-            &preflight,
-        )
-        .await;
+        run_btc_candle_loop(fetch_interval_secs, &context, &retrying, dotenv_path).await;
     } else {
         println!("execution mode=mock (polymarket_http_url is empty)");
         let retrying = RetryingExecutionClient::new(
@@ -226,27 +532,7 @@ async fn main() -> anyhow::Result<()> {
             execution_settings.max_retries,
             execution_settings.timeout_secs * 100,
         );
-        let trade_cooldown_secs = read_trade_cooldown_secs(Path::new("src/.env"), 300);
-        let positions_path = std::env::var("POSITIONS_PATH").ok().map(std::path::PathBuf::from);
-        let positions_path_ref = positions_path.as_deref().unwrap_or(Path::new("data/positions.json"));
-        let mut runner = EngineRunner::new(engine, retrying)
-            .with_trade_cooldown_secs(trade_cooldown_secs)
-            .with_position_manager(load_positions(positions_path_ref));
-        run_live_market_loop(
-            &execution_settings,
-            fetch_interval_secs,
-            scan_top_n,
-            scan_max_sum,
-            scan_min_edge,
-            scan_settle_guard_minutes,
-            &context,
-            &mut runner,
-            None,
-            positions_path_ref,
-            dotenv_path,
-            &preflight,
-        )
-        .await;
+        run_btc_candle_loop(fetch_interval_secs, &context, &retrying, dotenv_path).await;
     }
 
     Ok(())

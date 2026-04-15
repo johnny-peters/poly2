@@ -1,6 +1,6 @@
 strategies:
   arbitrage:
-    enabled: true
+    enabled: false
     min_profit_threshold: '0.07'
     slippage_bps: 10
     min_liquidity: '100'
