@@ -13,8 +13,8 @@ strategies:
     enabled: false
 
 risk:
-  max_position_pct: '0.05'
-  max_single_trade_pct: '0.05'
+  max_position_pct: '0.10'
+  max_single_trade_pct: '0.10'
   daily_loss_limit_pct: '0.05'
 
 execution:

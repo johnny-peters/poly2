@@ -8,13 +8,17 @@ use polymarket_client_sdk::types::{Address as PmAddress, Decimal as PmDecimal, U
 use polymarket_client_sdk::{
     derive_proxy_wallet, derive_safe_wallet, POLYGON as PM_POLYGON, PRIVATE_KEY_VAR,
 };
+use futures::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use poly2::{
     run_healthcheck, scan_arb_candidates, AppConfig, ArbitrageStrategy,
@@ -48,12 +52,201 @@ async fn fetch_clob_price(token_id: &str, side: &str) -> anyhow::Result<Decimal>
     Ok(Decimal::from_str(raw.trim())?)
 }
 
-async fn fetch_clob_best_ask(token_id: &str) -> anyhow::Result<Decimal> {
-    fetch_clob_price(token_id, "buy").await
-}
-
 async fn fetch_clob_best_bid(token_id: &str) -> anyhow::Result<Decimal> {
     fetch_clob_price(token_id, "sell").await
+}
+
+#[derive(Debug, Clone, Default)]
+struct TokenPrices {
+    best_ask: Decimal,
+    best_bid: Decimal,
+}
+
+#[derive(Clone)]
+struct WsPriceCache {
+    up: Arc<RwLock<TokenPrices>>,
+    down: Arc<RwLock<TokenPrices>>,
+    up_token_id: String,
+    down_token_id: String,
+}
+
+impl WsPriceCache {
+    fn new(up_token_id: &str, down_token_id: &str) -> Self {
+        Self {
+            up: Arc::new(RwLock::new(TokenPrices::default())),
+            down: Arc::new(RwLock::new(TokenPrices::default())),
+            up_token_id: up_token_id.to_string(),
+            down_token_id: down_token_id.to_string(),
+        }
+    }
+
+    async fn up_ask(&self) -> Decimal {
+        self.up.read().await.best_ask
+    }
+    async fn down_ask(&self) -> Decimal {
+        self.down.read().await.best_ask
+    }
+    async fn bid_for(&self, token_id: &str) -> Decimal {
+        if token_id == self.up_token_id {
+            self.up.read().await.best_bid
+        } else {
+            self.down.read().await.best_bid
+        }
+    }
+    async fn ask_for(&self, token_id: &str) -> Decimal {
+        if token_id == self.up_token_id {
+            self.up.read().await.best_ask
+        } else {
+            self.down.read().await.best_ask
+        }
+    }
+}
+
+fn spawn_ws_price_feed(cache: WsPriceCache, cancel: tokio::sync::watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut cancel = cancel;
+        let url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+
+        'reconnect: loop {
+            if *cancel.borrow() { return; }
+
+            let ws_conn = tokio::select! {
+                res = tokio_tungstenite::connect_async(url) => res,
+                _ = cancel.changed() => return,
+            };
+            let (mut ws, _resp) = match ws_conn {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("ws_price: connect failed: {e}, retrying in 2s");
+                    tokio::select! {
+                        _ = time::sleep(Duration::from_secs(2)) => {},
+                        _ = cancel.changed() => return,
+                    }
+                    continue 'reconnect;
+                }
+            };
+
+            let sub = serde_json::json!({
+                "assets_ids": [&cache.up_token_id, &cache.down_token_id],
+                "type": "market",
+                "custom_feature_enabled": true
+            });
+            if ws.send(WsMessage::Text(sub.to_string().into())).await.is_err() {
+                eprintln!("ws_price: subscribe send failed, reconnecting");
+                continue 'reconnect;
+            }
+            println!("ws_price: connected & subscribed (up={}, down={})",
+                &cache.up_token_id[..8.min(cache.up_token_id.len())],
+                &cache.down_token_id[..8.min(cache.down_token_id.len())]);
+
+            let mut last_ping = tokio::time::Instant::now();
+
+            loop {
+                if *cancel.borrow() {
+                    let _ = ws.close(None).await;
+                    return;
+                }
+
+                let msg = tokio::select! {
+                    m = ws.next() => match m {
+                        Some(Ok(m)) => m,
+                        Some(Err(e)) => {
+                            eprintln!("ws_price: read error: {e}, reconnecting");
+                            break; // -> reconnect
+                        }
+                        None => {
+                            eprintln!("ws_price: stream closed, reconnecting");
+                            break;
+                        }
+                    },
+                    _ = cancel.changed() => {
+                        let _ = ws.close(None).await;
+                        return;
+                    },
+                    _ = time::sleep(Duration::from_secs(30)) => {
+                        eprintln!("ws_price: no message for 30s, reconnecting");
+                        break;
+                    }
+                };
+
+                if last_ping.elapsed() >= Duration::from_secs(10) {
+                    let _ = ws.send(WsMessage::text("PING")).await;
+                    last_ping = tokio::time::Instant::now();
+                }
+
+                let text = match &msg {
+                    WsMessage::Text(t) => t.clone(),
+                    WsMessage::Ping(d) => {
+                        let _ = ws.send(WsMessage::Pong(d.clone())).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+
+                let val: serde_json::Value = match serde_json::from_str(text.as_ref()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                let event = val.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
+
+                match event {
+                    "book" => {
+                        let asset_id = val.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let best_ask = val.get("asks")
+                            .and_then(|a| a.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|o| o.get("price"))
+                            .and_then(|p| p.as_str())
+                            .and_then(|s| Decimal::from_str(s).ok())
+                            .unwrap_or(Decimal::ZERO);
+                        let best_bid = val.get("bids")
+                            .and_then(|a| a.as_array())
+                            .and_then(|a| a.last())
+                            .and_then(|o| o.get("price"))
+                            .and_then(|p| p.as_str())
+                            .and_then(|s| Decimal::from_str(s).ok())
+                            .unwrap_or(Decimal::ZERO);
+                        let lock = if asset_id == cache.up_token_id { &cache.up } else { &cache.down };
+                        let mut w = lock.write().await;
+                        w.best_ask = best_ask;
+                        w.best_bid = best_bid;
+                    }
+                    "best_bid_ask" => {
+                        let asset_id = val.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let best_ask = val.get("best_ask")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| Decimal::from_str(s).ok())
+                            .unwrap_or(Decimal::ZERO);
+                        let best_bid = val.get("best_bid")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| Decimal::from_str(s).ok())
+                            .unwrap_or(Decimal::ZERO);
+                        let lock = if asset_id == cache.up_token_id { &cache.up } else { &cache.down };
+                        let mut w = lock.write().await;
+                        if best_ask > Decimal::ZERO { w.best_ask = best_ask; }
+                        if best_bid > Decimal::ZERO { w.best_bid = best_bid; }
+                    }
+                    "price_change" => {
+                        if let Some(changes) = val.get("price_changes").and_then(|v| v.as_array()) {
+                            for ch in changes {
+                                let asset_id = ch.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
+                                let lock = if asset_id == cache.up_token_id { &cache.up } else { &cache.down };
+                                let mut w = lock.write().await;
+                                if let Some(ba) = ch.get("best_ask").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()) {
+                                    if ba > Decimal::ZERO { w.best_ask = ba; }
+                                }
+                                if let Some(bb) = ch.get("best_bid").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()) {
+                                    if bb > Decimal::ZERO { w.best_bid = bb; }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
 }
 
 fn read_decimal_env_or(dotenv_path: &Path, key: &str, default_value: Decimal) -> Decimal {
@@ -71,18 +264,19 @@ fn read_u64_env_or(dotenv_path: &Path, key: &str, default_value: u64) -> u64 {
 async fn run_btc_candle_loop<C>(
     _interval_secs: u64,
     context: &StrategyContext,
+    risk_engine: &RiskEngine,
     execution: &C,
     dotenv_path: &Path,
 ) where
     C: ExecutionClient,
 {
-    let order_usd = read_decimal_env_or(dotenv_path, "BTC_CANDLE_ORDER_USD", Decimal::from(2_u32));
+    let base_order_usd = read_decimal_env_or(dotenv_path, "BTC_CANDLE_ORDER_USD", Decimal::from(2_u32));
     let entry_threshold = read_decimal_env_or(
         dotenv_path,
         "BTC_CANDLE_ENTRY_THRESHOLD",
         Decimal::from_str("0.72").unwrap_or(Decimal::from(72_u32) / Decimal::from(100_u32)),
     );
-    let stop_loss_price = read_decimal_env_or(
+    let base_stop_loss = read_decimal_env_or(
         dotenv_path,
         "BTC_CANDLE_STOP_LOSS",
         Decimal::from_str("0.50").unwrap_or(Decimal::from(1_u32) / Decimal::from(2_u32)),
@@ -93,13 +287,54 @@ async fn run_btc_candle_loop<C>(
         Decimal::from_str("0.84").unwrap_or(Decimal::from(84_u32) / Decimal::from(100_u32)),
     );
     let poll_ms = read_u64_env_or(dotenv_path, "BTC_CANDLE_POLL_MS", 1000);
-
-    println!(
-        "btc_candle: order_usd={}, entry_threshold={}, stop_loss={}, take_profit={}, poll_ms={}",
-        order_usd, entry_threshold, stop_loss_price, take_profit_price, poll_ms
+    let max_entry_sum = read_decimal_env_or(
+        dotenv_path,
+        "BTC_CANDLE_MAX_ENTRY_SUM",
+        Decimal::from_str("1.02").unwrap_or(Decimal::ONE),
+    );
+    let max_spread = read_decimal_env_or(
+        dotenv_path,
+        "BTC_CANDLE_MAX_SPREAD",
+        Decimal::from_str("0.10").unwrap_or(Decimal::ONE),
+    );
+    let early_exit_secs: i64 = read_u64_env_or(dotenv_path, "BTC_CANDLE_EARLY_EXIT_SECS", 45) as i64;
+    let near_certain = read_decimal_env_or(
+        dotenv_path,
+        "BTC_CANDLE_NEAR_CERTAIN",
+        Decimal::from_str("0.95").unwrap_or(Decimal::ONE),
+    );
+    let max_consec_losses = read_u64_env_or(dotenv_path, "BTC_CANDLE_MAX_CONSEC_LOSSES", 3);
+    let loss_cooldown_secs = read_u64_env_or(dotenv_path, "BTC_CANDLE_LOSS_COOLDOWN_SECS", 600);
+    let signal_boost_threshold = read_decimal_env_or(
+        dotenv_path,
+        "BTC_CANDLE_SIGNAL_BOOST_THRESHOLD",
+        Decimal::from_str("0.80").unwrap_or(Decimal::ONE),
+    );
+    let signal_boost_multiplier = read_decimal_env_or(
+        dotenv_path,
+        "BTC_CANDLE_SIGNAL_BOOST_MULTIPLIER",
+        Decimal::from_str("1.5").unwrap_or(Decimal::ONE),
     );
 
-    let _ = context;
+    println!(
+        "btc_candle: base_order_usd={}, entry_threshold={}, base_stop_loss={}, take_profit={}, poll_ms={}",
+        base_order_usd, entry_threshold, base_stop_loss, take_profit_price, poll_ms
+    );
+    println!(
+        "btc_candle: max_entry_sum={}, max_spread={}, early_exit_secs={}, near_certain={}",
+        max_entry_sum, max_spread, early_exit_secs, near_certain
+    );
+    println!(
+        "btc_candle: max_consec_losses={}, loss_cooldown_secs={}, signal_boost_threshold={}, signal_boost_multiplier={}",
+        max_consec_losses, loss_cooldown_secs, signal_boost_threshold, signal_boost_multiplier
+    );
+
+    let mut daily_pnl = context.risk.daily_pnl;
+    let mut consecutive_losses: u64 = 0;
+    let mut total_rounds: u64 = 0;
+    let mut winning_rounds: u64 = 0;
+    let round_log_path = Path::new("data/btc_candle_rounds.jsonl");
+
     let mut loop_idx: u64 = 0;
     let mut first_round = true;
     loop {
@@ -149,10 +384,29 @@ async fn run_btc_candle_loop<C>(
             market.market_id, market.market_slug, market.up_token_id, market.down_token_id
         );
 
-        // --- Phase 3: poll ask prices until one exceeds entry_threshold ---
+        // --- Phase 3: risk guard — consecutive loss cooldown ---
+        if consecutive_losses >= max_consec_losses {
+            println!(
+                "btc_candle: {} consecutive losses >= max {}, cooling down {}s",
+                consecutive_losses, max_consec_losses, loss_cooldown_secs
+            );
+            time::sleep(Duration::from_secs(loss_cooldown_secs)).await;
+            consecutive_losses = 0;
+            continue;
+        }
+
+        // --- Phase 3b: start WebSocket price feed for this round ---
+        let ws_cache = WsPriceCache::new(&market.up_token_id, &market.down_token_id);
+        let (ws_cancel_tx, ws_cancel_rx) = tokio::sync::watch::channel(false);
+        let ws_handle = spawn_ws_price_feed(ws_cache.clone(), ws_cancel_rx);
+        // wait briefly for initial book snapshot from WS
+        time::sleep(Duration::from_millis(1500)).await;
+
+        // --- Phase 4: poll ask prices until one exceeds entry_threshold ---
         let mut bought_side: Option<poly2::Side> = None;
         let mut bought_token_id = String::new();
         let mut bought_size = Decimal::ZERO;
+        let mut entry_price = Decimal::ZERO;
 
         'entry: loop {
             let now = Utc::now().timestamp();
@@ -161,16 +415,12 @@ async fn run_btc_candle_loop<C>(
                 break 'entry;
             }
 
-            let (up_ask, down_ask) = tokio::join!(
-                fetch_clob_best_ask(&market.up_token_id),
-                fetch_clob_best_ask(&market.down_token_id)
-            );
-            let up_val = up_ask.unwrap_or(Decimal::ZERO);
-            let down_val = down_ask.unwrap_or(Decimal::ZERO);
+            let up_val = ws_cache.up_ask().await;
+            let down_val = ws_cache.down_ask().await;
 
             println!(
-                "btc_candle poll: up_ask={} down_ask={} threshold={} remaining={}s",
-                up_val, down_val, entry_threshold, close_ts - now
+                "btc_candle poll: up_ask={} down_ask={} sum={} threshold={} remaining={}s",
+                up_val, down_val, up_val + down_val, entry_threshold, close_ts - now
             );
 
             let (trigger_side, trigger_price, trigger_token) =
@@ -187,28 +437,84 @@ async fn run_btc_candle_loop<C>(
                 time::sleep(Duration::from_millis(poll_ms)).await;
                 continue 'entry;
             }
-            let min_size = Decimal::from(5_u32);
-            let size = (order_usd / trigger_price).round_dp(2).max(min_size);
-            println!(
-                "btc_candle: ENTRY triggered! side={:?} price={} size={} (order_usd={})",
-                trigger_side, trigger_price, size, order_usd
-            );
 
-            let signal = poly2::StrategySignal {
+            // [P1] Two-sided spread check: reject overpriced markets
+            let ask_sum = up_val + down_val;
+            if ask_sum > max_entry_sum {
+                println!(
+                    "btc_candle: SKIP — ask sum {} > max_entry_sum {}, market charging premium",
+                    ask_sum, max_entry_sum
+                );
+                time::sleep(Duration::from_millis(poll_ms)).await;
+                continue 'entry;
+            }
+
+            // [P2] Bid-ask spread guard: ensure we can exit without huge slippage
+            let trigger_bid = ws_cache.bid_for(&trigger_token).await;
+            let spread = trigger_price - trigger_bid;
+            if trigger_bid > Decimal::ZERO && spread > max_spread {
+                println!(
+                    "btc_candle: SKIP — bid-ask spread {} (ask={} bid={}) > max_spread {}",
+                    spread, trigger_price, trigger_bid, max_spread
+                );
+                time::sleep(Duration::from_millis(poll_ms)).await;
+                continue 'entry;
+            }
+
+            // Strict entry: always buy at entry_threshold, never chase higher prices
+            let buy_price = entry_threshold;
+
+            if trigger_price > buy_price + max_spread {
+                println!(
+                    "btc_candle: ask {} too far above buy_price {} (max_spread={}), waiting for pullback",
+                    trigger_price, buy_price, max_spread
+                );
+                time::sleep(Duration::from_millis(poll_ms)).await;
+                continue 'entry;
+            }
+
+            // [P2] Signal-strength weighted position sizing
+            let order_usd = if trigger_price >= signal_boost_threshold {
+                let boosted = (base_order_usd * signal_boost_multiplier).round_dp(2);
+                println!("btc_candle: strong signal ({} >= {}), boosted order_usd {} -> {}", trigger_price, signal_boost_threshold, base_order_usd, boosted);
+                boosted
+            } else {
+                base_order_usd
+            };
+
+            let min_size = Decimal::from(5_u32);
+            let size = (order_usd / buy_price).round_dp(2).max(min_size);
+
+            // [P0] Risk engine check before entry
+            let mut risk_ctx = context.clone();
+            risk_ctx.risk.daily_pnl = daily_pnl;
+            let candidate_signal = poly2::StrategySignal {
                 strategy_id: StrategyId::ProbabilityTrading,
                 market_id: market.market_id.clone(),
                 yes_token_id: Some(market.up_token_id.clone()),
                 no_token_id: Some(market.down_token_id.clone()),
                 actions: vec![poly2::OrderIntent {
                     side: trigger_side.clone(),
-                    price: trigger_price,
+                    price: buy_price,
                     size,
                     sell: false,
                 }],
                 state: poly2::StrategyState::Implemented,
             };
+            if !risk_engine.allow(&candidate_signal, &risk_ctx) {
+                println!(
+                    "btc_candle: BLOCKED by risk engine (daily_pnl={}, capital={})",
+                    daily_pnl, risk_ctx.risk.total_capital
+                );
+                break 'entry;
+            }
 
-            match execution.submit(&signal).await {
+            println!(
+                "btc_candle: ENTRY triggered! side={:?} buy_price={} ask={} size={} (order_usd={}) bid={} spread={}",
+                trigger_side, buy_price, trigger_price, size, order_usd, trigger_bid, spread
+            );
+
+            match execution.submit(&candidate_signal).await {
                 Ok(report) => {
                     print_execution_report(&report);
                     let mut final_status = report.status.clone();
@@ -257,12 +563,13 @@ async fn run_btc_candle_loop<C>(
                         ExecutionStatus::Filled | ExecutionStatus::PartiallyFilled => {
                             bought_side = Some(trigger_side);
                             bought_token_id = trigger_token;
+                            entry_price = buy_price;
                             let fill_size_sum: Decimal =
                                 report.fills.iter().filter(|f| !f.sell).map(|f| f.size).sum();
                             bought_size = if fill_size_sum > Decimal::ZERO && fill_size_sum < size {
-                                fill_size_sum
+                                (fill_size_sum * Decimal::new(98, 2)).round_dp(2)
                             } else {
-                                (size * Decimal::new(995, 3)).round_dp(2)
+                                (size * Decimal::new(98, 2)).round_dp(2)
                             };
                             println!(
                                 "btc_candle: adjusted bought_size={} (raw={})",
@@ -270,38 +577,99 @@ async fn run_btc_candle_loop<C>(
                             );
                         }
                         _ => {
-                            eprintln!(
-                                "btc_candle: buy order not filled (status={:?}), skipping entry",
-                                final_status
+                            let current_ask = ws_cache.ask_for(&trigger_token).await;
+                            if current_ask > buy_price + max_spread {
+                                println!(
+                                    "btc_candle: buy not filled (status={:?}), ask {} too far from buy_price {}, skipping entry",
+                                    final_status, current_ask, buy_price
+                                );
+                                break 'entry;
+                            }
+                            println!(
+                                "btc_candle: buy order not filled (status={:?}), ask {} still near buy_price {}, retrying",
+                                final_status, current_ask, buy_price
                             );
+                            time::sleep(Duration::from_millis(poll_ms)).await;
+                            continue 'entry;
                         }
                     }
                 }
-                Err(err) => eprintln!("btc_candle: buy execution failed: {err}"),
+                Err(err) => {
+                    eprintln!("btc_candle: buy execution failed: {err}");
+                    break 'entry;
+                }
             }
             break 'entry;
         }
 
-        // --- Phase 4: if we bought, monitor for stop-loss / take-profit ---
+        // --- Phase 5: if we bought, monitor for stop-loss / take-profit ---
+        let mut exit_price = Decimal::ZERO;
+        let mut exit_reason = "none";
+
         if let Some(ref exit_side) = bought_side {
             println!(
-                "btc_candle: holding {:?}, monitoring stop_loss<={} / take_profit>={}",
-                exit_side, stop_loss_price, take_profit_price
+                "btc_candle: holding {:?} entry={}, SL={}, TP={}",
+                exit_side, entry_price, base_stop_loss, take_profit_price
             );
 
             'exit: loop {
                 let now = Utc::now().timestamp();
-                if now >= close_ts - 5 {
-                    println!("btc_candle: window closing, letting market resolve");
-                    break 'exit;
+                let remaining = close_ts - now;
+
+                // [P0] Early exit: sell to lock profits before window closes
+                if remaining <= early_exit_secs {
+                    let current_bid = ws_cache.bid_for(&bought_token_id).await;
+                    let current_ask = ws_cache.ask_for(&bought_token_id).await;
+
+                    if current_ask >= near_certain {
+                        println!(
+                            "btc_candle: window closing in {}s, price {} >= near_certain {}, letting resolve",
+                            remaining, current_ask, near_certain
+                        );
+                        exit_reason = "resolved_near_certain";
+                        exit_price = Decimal::ONE;
+                        break 'exit;
+                    }
+
+                    if current_bid > entry_price {
+                        println!(
+                            "btc_candle: EARLY PROFIT EXIT — {}s left, bid {} > entry {}, selling to lock profit",
+                            remaining, current_bid, entry_price
+                        );
+                        let sell_price = if current_bid > Decimal::ZERO { current_bid } else { current_ask };
+                        exit_price = sell_price;
+                        exit_reason = "early_profit_exit";
+
+                        let signal = poly2::StrategySignal {
+                            strategy_id: StrategyId::ProbabilityTrading,
+                            market_id: market.market_id.clone(),
+                            yes_token_id: Some(market.up_token_id.clone()),
+                            no_token_id: Some(market.down_token_id.clone()),
+                            actions: vec![poly2::OrderIntent {
+                                side: exit_side.clone(),
+                                price: sell_price,
+                                size: bought_size,
+                                sell: true,
+                            }],
+                            state: poly2::StrategyState::Implemented,
+                        };
+                        match execution.submit(&signal).await {
+                            Ok(report) => print_execution_report(&report),
+                            Err(err) => eprintln!("btc_candle: early exit sell failed: {err}"),
+                        }
+                        break 'exit;
+                    }
+
+                    if remaining <= 5 {
+                        println!("btc_candle: window closing, bid {} <= entry {}, letting resolve", current_bid, entry_price);
+                        exit_reason = "resolved_at_loss";
+                        exit_price = Decimal::ZERO;
+                        break 'exit;
+                    }
                 }
 
-                let (up_ask_res, down_ask_res) = tokio::join!(
-                    fetch_clob_best_ask(&market.up_token_id),
-                    fetch_clob_best_ask(&market.down_token_id)
-                );
-                let up_val = up_ask_res.unwrap_or(Decimal::ZERO);
-                let down_val = down_ask_res.unwrap_or(Decimal::ZERO);
+                let up_val = ws_cache.up_ask().await;
+                let down_val = ws_cache.down_ask().await;
                 let current_ask = if bought_token_id == market.up_token_id {
                     up_val
                 } else {
@@ -310,28 +678,34 @@ async fn run_btc_candle_loop<C>(
 
                 println!(
                     "btc_candle exit: up_ask={} down_ask={} held_price={} SL={} TP={} remaining={}s",
-                    up_val, down_val, current_ask, stop_loss_price, take_profit_price, close_ts - now
+                    up_val, down_val, current_ask, base_stop_loss, take_profit_price, remaining
                 );
 
-                let trigger = if current_ask <= stop_loss_price {
-                    println!("btc_candle: STOP LOSS triggered at {}", current_ask);
+                let trigger = if current_ask <= base_stop_loss {
+                    println!("btc_candle: STOP LOSS triggered at {} (SL={})", current_ask, base_stop_loss);
+                    exit_reason = "stop_loss";
                     true
                 } else if current_ask >= take_profit_price {
                     println!("btc_candle: TAKE PROFIT triggered at {}", current_ask);
+                    exit_reason = "take_profit";
                     true
                 } else {
                     false
                 };
 
                 if trigger {
-                    let sell_price = fetch_clob_best_bid(&bought_token_id)
-                        .await
-                        .unwrap_or(current_ask);
+                    let ws_bid = ws_cache.bid_for(&bought_token_id).await;
+                    let sell_price = if ws_bid > Decimal::ZERO {
+                        ws_bid
+                    } else {
+                        fetch_clob_best_bid(&bought_token_id).await.unwrap_or(current_ask)
+                    };
                     let sell_price = if sell_price > Decimal::ZERO {
                         sell_price
                     } else {
                         current_ask
                     };
+                    exit_price = sell_price;
 
                     println!(
                         "btc_candle: SELL side={:?} price={} size={}",
@@ -354,7 +728,34 @@ async fn run_btc_candle_loop<C>(
 
                     match execution.submit(&signal).await {
                         Ok(report) => print_execution_report(&report),
-                        Err(err) => eprintln!("btc_candle: sell execution failed: {err}"),
+                        Err(err) => {
+                            eprintln!("btc_candle: sell execution failed: {err}, retrying with 95% size");
+                            let retry_size = (bought_size * Decimal::new(95, 2)).round_dp(2);
+                            let retry_signal = poly2::StrategySignal {
+                                strategy_id: StrategyId::ProbabilityTrading,
+                                market_id: market.market_id.clone(),
+                                yes_token_id: Some(market.up_token_id.clone()),
+                                no_token_id: Some(market.down_token_id.clone()),
+                                actions: vec![poly2::OrderIntent {
+                                    side: exit_side.clone(),
+                                    price: sell_price,
+                                    size: retry_size,
+                                    sell: true,
+                                }],
+                                state: poly2::StrategyState::Implemented,
+                            };
+                            match execution.submit(&retry_signal).await {
+                                Ok(report) => {
+                                    print_execution_report(&report);
+                                    bought_size = retry_size;
+                                }
+                                Err(err2) => {
+                                    eprintln!("btc_candle: sell retry also failed: {err2}, marking as unresolved");
+                                    exit_price = Decimal::ZERO;
+                                    exit_reason = "sell_failed";
+                                }
+                            }
+                        }
                     }
                     break 'exit;
                 }
@@ -362,6 +763,46 @@ async fn run_btc_candle_loop<C>(
                 time::sleep(Duration::from_millis(poll_ms)).await;
             }
         }
+
+        // --- Phase 6: round PnL tracking ---
+        if bought_side.is_some() {
+            let round_pnl = (exit_price - entry_price) * bought_size;
+            daily_pnl += round_pnl;
+            total_rounds += 1;
+            let is_win = round_pnl > Decimal::ZERO;
+            if is_win {
+                winning_rounds += 1;
+                consecutive_losses = 0;
+            } else {
+                consecutive_losses += 1;
+            }
+            let win_rate = if total_rounds > 0 {
+                Decimal::from(winning_rounds) / Decimal::from(total_rounds) * Decimal::from(100_u32)
+            } else {
+                Decimal::ZERO
+            };
+
+            println!(
+                "btc_candle STATS: round_pnl={} daily_pnl={} win_rate={:.1}% ({}/{}) consec_losses={} reason={}",
+                round_pnl, daily_pnl, win_rate, winning_rounds, total_rounds, consecutive_losses, exit_reason
+            );
+
+            append_round_record(
+                round_log_path,
+                loop_idx,
+                &market.market_slug,
+                bought_side.as_ref().map(|s| format!("{:?}", s)).unwrap_or_default(),
+                entry_price,
+                exit_price,
+                bought_size,
+                round_pnl,
+                exit_reason,
+            );
+        }
+
+        // shutdown WS price feed for this round
+        let _ = ws_cancel_tx.send(true);
+        ws_handle.abort();
 
         println!("btc_candle: round #{} complete", loop_idx);
     }
@@ -468,8 +909,8 @@ async fn main() -> anyhow::Result<()> {
     registry.register(Arc::new(TodoStrategy::new(StrategyId::MarketMaking)));
     registry.register(Arc::new(TodoStrategy::new(StrategyId::LatencyArbitrage)));
 
-    let _risk_engine = RiskEngine::new(app_config.risk_config()?);
-    let _engine = TradingEngine::new(registry, _risk_engine);
+    let risk_engine = RiskEngine::new(app_config.risk_config()?);
+    let _engine = TradingEngine::new(registry, RiskEngine::new(app_config.risk_config()?));
 
     let execution_settings = app_config.execution_settings();
     println!(
@@ -479,18 +920,18 @@ async fn main() -> anyhow::Result<()> {
         execution_settings.timeout_secs
     );
     let fetch_interval_secs = read_fetch_interval_secs(Path::new("src/.env"), 60);
-    let scan_max_sum = read_scan_max_sum(Path::new("src/.env"), Decimal::from_str("1.005")?);
-    let scan_min_edge = read_scan_min_edge(Path::new("src/.env"), Decimal::from_str("0.005")?);
-    let scan_top_n = read_scan_top_n(Path::new("src/.env"), 5);
-    let scan_settle_guard_minutes = execution_settings.scan_min_minutes_to_settle;
-    println!("market scan interval={}s (from FETCH_INTERVAL)", fetch_interval_secs);
-    println!("market scan top_n={} (from SCAN_TOP_N)", scan_top_n);
-    println!("market scan max_sum={} (from SCAN_MAX_SUM)", scan_max_sum);
-    println!("market scan min_edge={} (from SCAN_MIN_EDGE)", scan_min_edge);
-    println!(
-        "market scan settle_guard_minutes={} (from SCAN_MIN_MINUTES_TO_SETTLE)",
-        scan_settle_guard_minutes
-    );
+    let _scan_max_sum = read_scan_max_sum(Path::new("src/.env"), Decimal::from_str("1.005")?);
+    let _scan_min_edge = read_scan_min_edge(Path::new("src/.env"), Decimal::from_str("0.005")?);
+    let _scan_top_n = read_scan_top_n(Path::new("src/.env"), 5);
+    let _scan_settle_guard_minutes = execution_settings.scan_min_minutes_to_settle;
+    // println!("market scan interval={}s (from FETCH_INTERVAL)", fetch_interval_secs);
+    // println!("market scan top_n={} (from SCAN_TOP_N)", scan_top_n);
+    // println!("market scan max_sum={} (from SCAN_MAX_SUM)", scan_max_sum);
+    // println!("market scan min_edge={} (from SCAN_MIN_EDGE)", scan_min_edge);
+    // println!(
+    //     "market scan settle_guard_minutes={} (from SCAN_MIN_MINUTES_TO_SETTLE)",
+    //     scan_settle_guard_minutes
+    // );
     let preflight = run_startup_preflight(&app_config, dotenv_path)?;
     print_preflight_report(&preflight);
     let context = StrategyContext {
@@ -531,7 +972,7 @@ async fn main() -> anyhow::Result<()> {
             execution_settings.max_retries,
             execution_settings.timeout_secs * 100,
         );
-        run_btc_candle_loop(fetch_interval_secs, &context, &retrying, dotenv_path).await;
+        run_btc_candle_loop(fetch_interval_secs, &context, &risk_engine, &retrying, dotenv_path).await;
     } else {
         println!("execution mode=mock (polymarket_http_url is empty)");
         let retrying = RetryingExecutionClient::new(
@@ -539,7 +980,7 @@ async fn main() -> anyhow::Result<()> {
             execution_settings.max_retries,
             execution_settings.timeout_secs * 100,
         );
-        run_btc_candle_loop(fetch_interval_secs, &context, &retrying, dotenv_path).await;
+        run_btc_candle_loop(fetch_interval_secs, &context, &risk_engine, &retrying, dotenv_path).await;
     }
 
     Ok(())
@@ -731,6 +1172,43 @@ async fn run_sdk_auth_export(dotenv_path: &Path) -> anyhow::Result<()> {
         credentials.passphrase().expose_secret()
     );
     Ok(())
+}
+
+fn append_round_record(
+    log_path: &Path,
+    round: u64,
+    market_slug: &str,
+    side: String,
+    entry_price: Decimal,
+    exit_price: Decimal,
+    size: Decimal,
+    pnl: Decimal,
+    exit_reason: &str,
+) {
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let record = serde_json::json!({
+        "ts": Utc::now().to_rfc3339(),
+        "round": round,
+        "market": market_slug,
+        "side": side,
+        "entry": entry_price.to_string(),
+        "exit": exit_price.to_string(),
+        "size": size.to_string(),
+        "pnl": pnl.to_string(),
+        "reason": exit_reason,
+    });
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{}", record);
+        }
+        Err(e) => eprintln!("btc_candle: failed to write round log: {e}"),
+    }
 }
 
 fn print_execution_report(report: &ExecutionReport) {
