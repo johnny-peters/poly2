@@ -37,3 +37,5 @@
 {"entry":"0.72","exit":"0.81","market":"btc-updown-5m-1776315600","pnl":"0.6021","reason":"take_profit","round":5,"side":"Yes","size":"6.69","ts":"2026-04-16T05:02:06.902413200+00:00"}
 {"entry":"0.72","exit":"0.46","market":"btc-updown-5m-1776316200","pnl":"-1.7472","reason":"stop_loss","round":7,"side":"Yes","size":"6.72","ts":"2026-04-16T05:13:31.722326600+00:00"}
 {"entry":"0.72","exit":"0.83","market":"btc-updown-5m-1776316500","pnl":"0.748","reason":"take_profit","round":8,"side":"Yes","size":"6.8","ts":"2026-04-16T05:18:20.188997800+00:00"}
+{"entry":"0.72","exit":"0.83","market":"btc-updown-5m-1776316800","pnl":"0.737","reason":"take_profit","round":9,"side":"Yes","size":"6.7","ts":"2026-04-16T05:23:28.206527200+00:00"}
+{"entry":"0.72","exit":"0.87","market":"btc-updown-5m-1776317100","pnl":"1.0080","reason":"take_profit","round":10,"side":"Yes","size":"6.72","ts":"2026-04-16T05:27:14.419226900+00:00"}
