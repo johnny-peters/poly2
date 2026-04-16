@@ -24,7 +24,7 @@ use poly2::{
     run_healthcheck, scan_arb_candidates, AppConfig, ArbitrageStrategy,
     ExecutionClient, ExecutionReport, ExecutionSettings, ExecutionStatus,
     MockExecutionClient, RetryingExecutionClient, RiskContext, RiskEngine,
-    PolymarketSdkExecutionClient, StrategyContext, StrategyId, StrategyRegistry, TodoStrategy,
+    PolymarketSdkExecutionClient, Side, StrategyContext, StrategyId, StrategyRegistry, TodoStrategy,
     TradingEngine, discover_btc_candle_market,
 };
 
@@ -193,6 +193,7 @@ fn spawn_ws_price_feed(cache: WsPriceCache, cancel: tokio::sync::watch::Receiver
                 match event {
                     "book" => {
                         let asset_id = val.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
+                        // asks sorted ascending (lowest first) → first() = best ask
                         let best_ask = val.get("asks")
                             .and_then(|a| a.as_array())
                             .and_then(|a| a.first())
@@ -200,9 +201,10 @@ fn spawn_ws_price_feed(cache: WsPriceCache, cancel: tokio::sync::watch::Receiver
                             .and_then(|p| p.as_str())
                             .and_then(|s| Decimal::from_str(s).ok())
                             .unwrap_or(Decimal::ZERO);
+                        // bids sorted descending (highest first) → first() = best bid
                         let best_bid = val.get("bids")
                             .and_then(|a| a.as_array())
-                            .and_then(|a| a.last())
+                            .and_then(|a| a.first())
                             .and_then(|o| o.get("price"))
                             .and_then(|p| p.as_str())
                             .and_then(|s| Decimal::from_str(s).ok())
@@ -261,6 +263,218 @@ fn read_u64_env_or(dotenv_path: &Path, key: &str, default_value: u64) -> u64 {
         .unwrap_or(default_value)
 }
 
+/// Poll interval while waiting for a sell order to settle (ms).
+const BTC_CANDLE_SELL_POLL_MS: u64 = 1000;
+/// Max wall-clock seconds to poll a single sell order before cancel/retry.
+const BTC_CANDLE_SELL_POLL_SECS: i64 = 5;
+/// Max submit/cancel cycles for a single exit (stop / take profit / early profit).
+const BTC_CANDLE_MAX_SELL_ATTEMPTS: u32 = 3;
+
+#[derive(Debug)]
+struct BtcCandleSellResult {
+    /// Volume-weighted average limit price used for matched shares (for PnL).
+    exit_price: Decimal,
+    matched_shares: Decimal,
+    fully_exited: bool,
+}
+
+fn btc_candle_exit_signal(
+    market_id: &str,
+    up_token_id: &str,
+    down_token_id: &str,
+    exit_side: Side,
+    price: Decimal,
+    size: Decimal,
+) -> poly2::StrategySignal {
+    poly2::StrategySignal {
+        strategy_id: StrategyId::ProbabilityTrading,
+        market_id: market_id.to_string(),
+        yes_token_id: Some(up_token_id.to_string()),
+        no_token_id: Some(down_token_id.to_string()),
+        actions: vec![poly2::OrderIntent {
+            side: exit_side,
+            price,
+            size,
+            sell: true,
+        }],
+        state: poly2::StrategyState::Implemented,
+    }
+}
+
+/// Submit limit sells, poll for fills, cancel stale orders, and retry with a more aggressive price.
+async fn execute_sell_with_retry<C: ExecutionClient + ?Sized>(
+    execution: &C,
+    ws_cache: &WsPriceCache,
+    market_id: &str,
+    up_token_id: &str,
+    down_token_id: &str,
+    exit_side: Side,
+    bought_token_id: &str,
+    mut remaining: Decimal,
+    fallback_ask: Decimal,
+) -> BtcCandleSellResult {
+    let min_tick = Decimal::new(1, 2);
+    let mut total_matched = Decimal::ZERO;
+    let mut total_quote = Decimal::ZERO;
+
+    for attempt in 0..BTC_CANDLE_MAX_SELL_ATTEMPTS {
+        if remaining <= Decimal::ZERO {
+            break;
+        }
+
+        let step = min_tick * Decimal::from(attempt);
+        let mut base = ws_cache.bid_for(bought_token_id).await;
+        if base <= Decimal::ZERO {
+            if let Ok(b) = fetch_clob_best_bid(bought_token_id).await {
+                base = b;
+            }
+        }
+        if base <= Decimal::ZERO {
+            base = fallback_ask;
+        }
+        let sell_price = (base - step).max(min_tick).round_dp(2);
+
+        let signal = btc_candle_exit_signal(
+            market_id,
+            up_token_id,
+            down_token_id,
+            exit_side.clone(),
+            sell_price,
+            remaining.round_dp(2),
+        );
+
+        let report = match execution.submit(&signal).await {
+            Ok(r) => r,
+            Err(e) => {
+                let err_msg = e.to_string();
+                eprintln!(
+                    "btc_candle: sell submit failed (attempt {}/{}): {err_msg}",
+                    attempt + 1,
+                    BTC_CANDLE_MAX_SELL_ATTEMPTS
+                );
+                if err_msg.contains("not enough balance") {
+                    if let Some(bal_str) = err_msg
+                        .split("balance: ")
+                        .nth(1)
+                        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+                    {
+                        if let Ok(bal_raw) = bal_str.parse::<u64>() {
+                            let actual = Decimal::new(bal_raw as i64, 6);
+                            if actual > Decimal::ZERO && actual < remaining {
+                                println!(
+                                    "btc_candle: balance={} < remaining={}, adjusting sell size",
+                                    actual, remaining
+                                );
+                                remaining = (actual * Decimal::new(99, 2)).round_dp(2);
+                            }
+                        }
+                    }
+                    if remaining <= Decimal::ZERO {
+                        break;
+                    }
+                }
+                continue;
+            }
+        };
+        print_execution_report(&report);
+
+        let mut matched_cum = Decimal::ZERO;
+        let mut st = report.status.clone();
+
+        let fill_from_report: Decimal = report
+            .fills
+            .iter()
+            .filter(|f| f.sell)
+            .map(|f| f.size)
+            .sum();
+
+        if let Some(oid) = report.order_ids.first() {
+            let (s0, m0) = execution
+                .get_order_status(oid)
+                .await
+                .unwrap_or((report.status.clone(), Decimal::ZERO));
+            st = s0;
+            matched_cum = m0;
+        } else if matches!(report.status, ExecutionStatus::Filled) && fill_from_report > Decimal::ZERO {
+            matched_cum = fill_from_report;
+            st = ExecutionStatus::Filled;
+        } else if matches!(report.status, ExecutionStatus::Filled) {
+            matched_cum = remaining;
+            st = ExecutionStatus::Filled;
+        }
+
+        if fill_from_report > matched_cum {
+            matched_cum = fill_from_report;
+        }
+
+        if let Some(oid) = report.order_ids.first() {
+            if matches!(
+                st,
+                ExecutionStatus::Pending | ExecutionStatus::PartiallyFilled
+            ) {
+                let poll_deadline = Utc::now().timestamp() + BTC_CANDLE_SELL_POLL_SECS;
+                loop {
+                    time::sleep(Duration::from_millis(BTC_CANDLE_SELL_POLL_MS)).await;
+                    match execution.get_order_status(oid).await {
+                        Ok((s, m)) => {
+                            st = s;
+                            matched_cum = m;
+                            if matches!(st, ExecutionStatus::Filled) {
+                                break;
+                            }
+                        }
+                        Err(e) => eprintln!("btc_candle: sell poll error: {e}"),
+                    }
+                    if Utc::now().timestamp() >= poll_deadline {
+                        break;
+                    }
+                }
+            }
+
+            if matches!(
+                st,
+                ExecutionStatus::Pending | ExecutionStatus::PartiallyFilled
+            ) {
+                match execution.cancel_order(oid).await {
+                    Ok(()) => {
+                        if let Ok((_, m_after)) = execution.get_order_status(oid).await {
+                            if m_after > matched_cum {
+                                matched_cum = m_after;
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("btc_candle: sell cancel failed: {e}"),
+                }
+            }
+        }
+
+        let filled = matched_cum.min(remaining).max(Decimal::ZERO);
+        if filled > Decimal::ZERO {
+            total_matched += filled;
+            total_quote += filled * sell_price;
+            remaining -= filled;
+        }
+
+        if remaining <= Decimal::new(1, 2) {
+            remaining = Decimal::ZERO;
+            break;
+        }
+    }
+
+    let exit_price = if total_matched > Decimal::ZERO {
+        total_quote / total_matched
+    } else {
+        Decimal::ZERO
+    };
+    let fully_exited = remaining <= Decimal::new(1, 2);
+
+    BtcCandleSellResult {
+        exit_price,
+        matched_shares: total_matched,
+        fully_exited,
+    }
+}
+
 async fn run_btc_candle_loop<C>(
     _interval_secs: u64,
     context: &StrategyContext,
@@ -314,6 +528,26 @@ async fn run_btc_candle_loop<C>(
         dotenv_path,
         "BTC_CANDLE_SIGNAL_BOOST_MULTIPLIER",
         Decimal::from_str("1.5").unwrap_or(Decimal::ONE),
+    );
+    let buy_slippage = read_decimal_env_or(
+        dotenv_path,
+        "BTC_CANDLE_BUY_SLIPPAGE",
+        Decimal::from_str("0.02").unwrap_or(Decimal::ZERO),
+    );
+    let exit_max_ask_sum = read_decimal_env_or(
+        dotenv_path,
+        "BTC_CANDLE_EXIT_MAX_ASK_SUM",
+        Decimal::from_str("1.50").unwrap_or(Decimal::from(2_u32)),
+    );
+    let exit_max_spread = read_decimal_env_or(
+        dotenv_path,
+        "BTC_CANDLE_EXIT_MAX_SPREAD",
+        Decimal::from_str("0.30").unwrap_or(Decimal::ONE),
+    );
+    let exit_max_bid_jump = read_decimal_env_or(
+        dotenv_path,
+        "BTC_CANDLE_EXIT_MAX_BID_JUMP",
+        Decimal::from_str("0.25").unwrap_or(Decimal::ONE),
     );
 
     println!(
@@ -461,13 +695,15 @@ async fn run_btc_candle_loop<C>(
                 continue 'entry;
             }
 
-            // Strict entry: always buy at entry_threshold, never chase higher prices
-            let buy_price = entry_threshold;
+            // Buy slightly above the current ask to ensure fill in fast-moving markets.
+            // entry_threshold + max_spread acts as a hard ceiling.
+            let buy_price = (trigger_price + buy_slippage).round_dp(2);
+            let buy_cap = (entry_threshold + max_spread).round_dp(2);
 
-            if trigger_price > buy_price + max_spread {
+            if buy_price > buy_cap {
                 println!(
-                    "btc_candle: ask {} too far above buy_price {} (max_spread={}), waiting for pullback",
-                    trigger_price, buy_price, max_spread
+                    "btc_candle: ask {} + slippage {} = {} > cap {} (threshold {} + spread {}), waiting for pullback",
+                    trigger_price, buy_slippage, buy_price, buy_cap, entry_threshold, max_spread
                 );
                 time::sleep(Duration::from_millis(poll_ms)).await;
                 continue 'entry;
@@ -519,18 +755,26 @@ async fn run_btc_candle_loop<C>(
                     print_execution_report(&report);
                     let mut final_status = report.status.clone();
                     let order_id_for_poll = report.order_ids.first().cloned();
+                    let mut last_matched = Decimal::ZERO;
 
-                    if matches!(final_status, ExecutionStatus::Pending) {
+                    if matches!(
+                        final_status,
+                        ExecutionStatus::Pending | ExecutionStatus::PartiallyFilled
+                    ) {
                         if let Some(ref oid) = order_id_for_poll {
-                            println!("btc_candle: order pending, polling up to 5s for fill...");
+                            println!("btc_candle: order not fully filled yet, polling up to 5s...");
                             let poll_deadline = Utc::now().timestamp() + 5;
                             loop {
                                 time::sleep(Duration::from_millis(1000)).await;
                                 match execution.get_order_status(oid).await {
-                                    Ok(s) => {
-                                        println!("btc_candle: poll status={:?}", s);
+                                    Ok((s, m)) => {
+                                        println!("btc_candle: poll status={:?} matched={}", s, m);
                                         final_status = s;
-                                        if !matches!(final_status, ExecutionStatus::Pending) {
+                                        last_matched = m;
+                                        if matches!(
+                                            final_status,
+                                            ExecutionStatus::Filled | ExecutionStatus::Rejected
+                                        ) {
                                             break;
                                         }
                                     }
@@ -548,14 +792,19 @@ async fn run_btc_candle_loop<C>(
                                 match execution.cancel_order(oid).await {
                                     Ok(()) => {
                                         println!("btc_candle: cancel accepted, re-checking status...");
-                                        if let Ok(s) = execution.get_order_status(oid).await {
-                                            println!("btc_candle: post-cancel status={:?}", s);
+                                        if let Ok((s, m)) = execution.get_order_status(oid).await {
+                                            println!("btc_candle: post-cancel status={:?} matched={}", s, m);
                                             final_status = s;
+                                            last_matched = last_matched.max(m);
                                         }
                                     }
                                     Err(e) => eprintln!("btc_candle: cancel failed: {e}"),
                                 }
                             }
+                        }
+                    } else if let Some(ref oid) = order_id_for_poll {
+                        if let Ok((_, m)) = execution.get_order_status(oid).await {
+                            last_matched = m;
                         }
                     }
 
@@ -566,14 +815,16 @@ async fn run_btc_candle_loop<C>(
                             entry_price = buy_price;
                             let fill_size_sum: Decimal =
                                 report.fills.iter().filter(|f| !f.sell).map(|f| f.size).sum();
-                            bought_size = if fill_size_sum > Decimal::ZERO && fill_size_sum < size {
-                                (fill_size_sum * Decimal::new(98, 2)).round_dp(2)
+                            let from_fills_or_api = last_matched.max(fill_size_sum).min(size);
+                            let raw_filled = if from_fills_or_api > Decimal::ZERO {
+                                from_fills_or_api
                             } else {
-                                (size * Decimal::new(98, 2)).round_dp(2)
+                                size
                             };
+                            bought_size = (raw_filled * Decimal::new(98, 2)).round_dp(2);
                             println!(
-                                "btc_candle: adjusted bought_size={} (raw={})",
-                                bought_size, size
+                                "btc_candle: adjusted bought_size={} (matched={} requested={})",
+                                bought_size, raw_filled, size
                             );
                         }
                         _ => {
@@ -605,12 +856,15 @@ async fn run_btc_candle_loop<C>(
         // --- Phase 5: if we bought, monitor for stop-loss / take-profit ---
         let mut exit_price = Decimal::ZERO;
         let mut exit_reason = "none";
+        // Shares used for round PnL when a sell actually matched (may differ from `bought_size` on partial exit).
+        let mut pnl_shares = bought_size;
 
         if let Some(ref exit_side) = bought_side {
             println!(
                 "btc_candle: holding {:?} entry={}, SL={}, TP={}",
                 exit_side, entry_price, base_stop_loss, take_profit_price
             );
+            let mut last_known_bid = Decimal::ZERO;
 
             'exit: loop {
                 let now = Utc::now().timestamp();
@@ -620,8 +874,26 @@ async fn run_btc_candle_loop<C>(
                 if remaining <= early_exit_secs {
                     let current_bid = ws_cache.bid_for(&bought_token_id).await;
                     let current_ask = ws_cache.ask_for(&bought_token_id).await;
+                    let early_spread = current_ask - current_bid;
+                    let early_bid_jump = if last_known_bid > Decimal::ZERO && current_bid > Decimal::ZERO {
+                        (current_bid - last_known_bid).abs()
+                    } else {
+                        Decimal::ZERO
+                    };
+                    let early_up = ws_cache.up_ask().await;
+                    let early_down = ws_cache.down_ask().await;
+                    let early_ask_sum = early_up + early_down;
 
-                    if current_ask >= near_certain {
+                    let early_data_ok = early_ask_sum <= exit_max_ask_sum
+                        && !(current_bid > Decimal::ZERO && early_spread > exit_max_spread)
+                        && early_bid_jump <= exit_max_bid_jump;
+
+                    if !early_data_ok {
+                        println!(
+                            "btc_candle: early exit STALE DATA (ask_sum={} spread={} bid_jump={}), skipping early decisions",
+                            early_ask_sum, early_spread, early_bid_jump
+                        );
+                    } else if current_ask >= near_certain {
                         println!(
                             "btc_candle: window closing in {}s, price {} >= near_certain {}, letting resolve",
                             remaining, current_ask, near_certain
@@ -631,39 +903,43 @@ async fn run_btc_candle_loop<C>(
                         break 'exit;
                     }
 
-                    if current_bid > entry_price {
+                    if early_data_ok && current_bid > entry_price {
                         println!(
                             "btc_candle: EARLY PROFIT EXIT — {}s left, bid {} > entry {}, selling to lock profit",
                             remaining, current_bid, entry_price
                         );
-                        let sell_price = if current_bid > Decimal::ZERO { current_bid } else { current_ask };
-                        exit_price = sell_price;
                         exit_reason = "early_profit_exit";
 
-                        let signal = poly2::StrategySignal {
-                            strategy_id: StrategyId::ProbabilityTrading,
-                            market_id: market.market_id.clone(),
-                            yes_token_id: Some(market.up_token_id.clone()),
-                            no_token_id: Some(market.down_token_id.clone()),
-                            actions: vec![poly2::OrderIntent {
-                                side: exit_side.clone(),
-                                price: sell_price,
-                                size: bought_size,
-                                sell: true,
-                            }],
-                            state: poly2::StrategyState::Implemented,
-                        };
-                        match execution.submit(&signal).await {
-                            Ok(report) => print_execution_report(&report),
-                            Err(err) => eprintln!("btc_candle: early exit sell failed: {err}"),
+                        let sell_out = execute_sell_with_retry(
+                            execution,
+                            &ws_cache,
+                            &market.market_id,
+                            &market.up_token_id,
+                            &market.down_token_id,
+                            exit_side.clone(),
+                            &bought_token_id,
+                            bought_size,
+                            current_ask,
+                        )
+                        .await;
+                        exit_price = sell_out.exit_price;
+                        if sell_out.matched_shares > Decimal::ZERO {
+                            pnl_shares = sell_out.matched_shares;
+                        }
+                        if !sell_out.fully_exited {
+                            eprintln!(
+                                "btc_candle: early exit sell incomplete matched={} remaining expected≈{}",
+                                sell_out.matched_shares, bought_size
+                            );
                         }
                         break 'exit;
                     }
 
                     if remaining <= 5 {
-                        println!("btc_candle: window closing, bid {} <= entry {}, letting resolve", current_bid, entry_price);
+                        let resolve_bid = if early_data_ok { current_bid } else { last_known_bid };
+                        println!("btc_candle: window closing, bid {} (reliable={}) <= entry {}, letting resolve", resolve_bid, early_data_ok, entry_price);
                         exit_reason = "resolved_at_loss";
-                        exit_price = Decimal::ZERO;
+                        exit_price = resolve_bid.max(Decimal::ZERO);
                         break 'exit;
                     }
                 }
@@ -675,18 +951,59 @@ async fn run_btc_candle_loop<C>(
                 } else {
                     down_val
                 };
+                let current_bid = ws_cache.bid_for(&bought_token_id).await;
+
+                let ask_sum = up_val + down_val;
+                let bid_ask_spread = current_ask - current_bid;
+                let bid_jump = if last_known_bid > Decimal::ZERO && current_bid > Decimal::ZERO {
+                    (current_bid - last_known_bid).abs()
+                } else {
+                    Decimal::ZERO
+                };
+
+                let data_reliable = if ask_sum > exit_max_ask_sum {
+                    println!(
+                        "btc_candle exit: STALE DATA — ask_sum={} > {} (up={} down={}), skipping TP/SL",
+                        ask_sum, exit_max_ask_sum, up_val, down_val
+                    );
+                    false
+                } else if current_bid > Decimal::ZERO && bid_ask_spread > exit_max_spread {
+                    println!(
+                        "btc_candle exit: WIDE SPREAD — spread={} > {} (ask={} bid={}), skipping TP/SL",
+                        bid_ask_spread, exit_max_spread, current_ask, current_bid
+                    );
+                    false
+                } else if bid_jump > exit_max_bid_jump {
+                    println!(
+                        "btc_candle exit: BID JUMP — |{} - {}| = {} > {}, skipping TP/SL",
+                        current_bid, last_known_bid, bid_jump, exit_max_bid_jump
+                    );
+                    false
+                } else {
+                    true
+                };
+
+                if current_bid > Decimal::ZERO && data_reliable {
+                    last_known_bid = current_bid;
+                }
 
                 println!(
-                    "btc_candle exit: up_ask={} down_ask={} held_price={} SL={} TP={} remaining={}s",
-                    up_val, down_val, current_ask, base_stop_loss, take_profit_price, remaining
+                    "btc_candle exit: up_ask={} down_ask={} held_ask={} held_bid={} SL={} TP={} reliable={} remaining={}s",
+                    up_val, down_val, current_ask, current_bid, base_stop_loss, take_profit_price, data_reliable, remaining
                 );
 
-                let trigger = if current_ask <= base_stop_loss {
-                    println!("btc_candle: STOP LOSS triggered at {} (SL={})", current_ask, base_stop_loss);
+                let trigger = if !data_reliable {
+                    false
+                } else if current_bid > Decimal::ZERO && current_bid <= base_stop_loss {
+                    println!("btc_candle: STOP LOSS triggered at bid={} (SL={})", current_bid, base_stop_loss);
                     exit_reason = "stop_loss";
                     true
-                } else if current_ask >= take_profit_price {
-                    println!("btc_candle: TAKE PROFIT triggered at {}", current_ask);
+                } else if current_ask <= base_stop_loss && current_bid <= Decimal::ZERO {
+                    println!("btc_candle: STOP LOSS triggered at ask={} (SL={}, bid unavailable)", current_ask, base_stop_loss);
+                    exit_reason = "stop_loss";
+                    true
+                } else if current_bid > Decimal::ZERO && current_bid >= take_profit_price {
+                    println!("btc_candle: TAKE PROFIT triggered at bid={} (TP={})", current_bid, take_profit_price);
                     exit_reason = "take_profit";
                     true
                 } else {
@@ -705,57 +1022,33 @@ async fn run_btc_candle_loop<C>(
                     } else {
                         current_ask
                     };
-                    exit_price = sell_price;
 
                     println!(
-                        "btc_candle: SELL side={:?} price={} size={}",
+                        "btc_candle: SELL side={:?} initial bid-based price≈{} size={}",
                         exit_side, sell_price, bought_size
                     );
 
-                    let signal = poly2::StrategySignal {
-                        strategy_id: StrategyId::ProbabilityTrading,
-                        market_id: market.market_id.clone(),
-                        yes_token_id: Some(market.up_token_id.clone()),
-                        no_token_id: Some(market.down_token_id.clone()),
-                        actions: vec![poly2::OrderIntent {
-                            side: exit_side.clone(),
-                            price: sell_price,
-                            size: bought_size,
-                            sell: true,
-                        }],
-                        state: poly2::StrategyState::Implemented,
-                    };
-
-                    match execution.submit(&signal).await {
-                        Ok(report) => print_execution_report(&report),
-                        Err(err) => {
-                            eprintln!("btc_candle: sell execution failed: {err}, retrying with 95% size");
-                            let retry_size = (bought_size * Decimal::new(95, 2)).round_dp(2);
-                            let retry_signal = poly2::StrategySignal {
-                                strategy_id: StrategyId::ProbabilityTrading,
-                                market_id: market.market_id.clone(),
-                                yes_token_id: Some(market.up_token_id.clone()),
-                                no_token_id: Some(market.down_token_id.clone()),
-                                actions: vec![poly2::OrderIntent {
-                                    side: exit_side.clone(),
-                                    price: sell_price,
-                                    size: retry_size,
-                                    sell: true,
-                                }],
-                                state: poly2::StrategyState::Implemented,
-                            };
-                            match execution.submit(&retry_signal).await {
-                                Ok(report) => {
-                                    print_execution_report(&report);
-                                    bought_size = retry_size;
-                                }
-                                Err(err2) => {
-                                    eprintln!("btc_candle: sell retry also failed: {err2}, marking as unresolved");
-                                    exit_price = Decimal::ZERO;
-                                    exit_reason = "sell_failed";
-                                }
-                            }
-                        }
+                    let sell_out = execute_sell_with_retry(
+                        execution,
+                        &ws_cache,
+                        &market.market_id,
+                        &market.up_token_id,
+                        &market.down_token_id,
+                        exit_side.clone(),
+                        &bought_token_id,
+                        bought_size,
+                        current_ask,
+                    )
+                    .await;
+                    exit_price = sell_out.exit_price;
+                    if sell_out.matched_shares > Decimal::ZERO {
+                        pnl_shares = sell_out.matched_shares;
+                    }
+                    if !sell_out.fully_exited {
+                        eprintln!(
+                            "btc_candle: sell incomplete after retries (matched={}, exit_reason={})",
+                            sell_out.matched_shares, exit_reason
+                        );
                     }
                     break 'exit;
                 }
@@ -766,14 +1059,22 @@ async fn run_btc_candle_loop<C>(
 
         // --- Phase 6: round PnL tracking ---
         if bought_side.is_some() {
-            let round_pnl = (exit_price - entry_price) * bought_size;
-            daily_pnl += round_pnl;
+            let round_pnl = (exit_price - entry_price) * pnl_shares;
+            let is_resolved = exit_reason.starts_with("resolved_");
+            if !is_resolved {
+                daily_pnl += round_pnl;
+            } else {
+                println!(
+                    "btc_candle: round settled by market resolution ({}), estimated pnl={} NOT counted toward daily_pnl",
+                    exit_reason, round_pnl
+                );
+            }
             total_rounds += 1;
             let is_win = round_pnl > Decimal::ZERO;
             if is_win {
                 winning_rounds += 1;
                 consecutive_losses = 0;
-            } else {
+            } else if !is_resolved {
                 consecutive_losses += 1;
             }
             let win_rate = if total_rounds > 0 {
@@ -794,7 +1095,7 @@ async fn run_btc_candle_loop<C>(
                 bought_side.as_ref().map(|s| format!("{:?}", s)).unwrap_or_default(),
                 entry_price,
                 exit_price,
-                bought_size,
+                pnl_shares,
                 round_pnl,
                 exit_reason,
             );

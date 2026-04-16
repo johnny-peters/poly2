@@ -77,11 +77,14 @@ pub enum ExecutionError {
     Backend(String),
 }
 
+/// Order status plus cumulative matched size (shares) from the exchange, when available.
+pub type OrderStatusSnapshot = (ExecutionStatus, Decimal);
+
 #[async_trait]
 pub trait ExecutionClient: Send + Sync {
     async fn submit(&self, signal: &StrategySignal) -> Result<ExecutionReport, ExecutionError>;
 
-    async fn get_order_status(&self, order_id: &str) -> Result<ExecutionStatus, ExecutionError> {
+    async fn get_order_status(&self, order_id: &str) -> Result<OrderStatusSnapshot, ExecutionError> {
         let _ = order_id;
         Err(ExecutionError::Backend("get_order_status not supported".into()))
     }
@@ -198,7 +201,7 @@ where
         }
     }
 
-    async fn get_order_status(&self, order_id: &str) -> Result<ExecutionStatus, ExecutionError> {
+    async fn get_order_status(&self, order_id: &str) -> Result<OrderStatusSnapshot, ExecutionError> {
         self.inner.get_order_status(order_id).await
     }
 
@@ -254,7 +257,7 @@ where
         Ok(report)
     }
 
-    async fn get_order_status(&self, order_id: &str) -> Result<ExecutionStatus, ExecutionError> {
+    async fn get_order_status(&self, order_id: &str) -> Result<OrderStatusSnapshot, ExecutionError> {
         self.inner.get_order_status(order_id).await
     }
 
@@ -383,19 +386,20 @@ impl ExecutionClient for PolymarketSdkExecutionClient {
         })
     }
 
-    async fn get_order_status(&self, order_id: &str) -> Result<ExecutionStatus, ExecutionError> {
+    async fn get_order_status(&self, order_id: &str) -> Result<OrderStatusSnapshot, ExecutionError> {
         let resp = self
             .client
             .order(order_id)
             .await
             .map_err(|e| ExecutionError::Backend(format!("get order failed: {e}")))?;
+        let matched = resp.size_matched;
         if resp.size_matched >= resp.original_size && resp.original_size > Decimal::ZERO {
-            return Ok(ExecutionStatus::Filled);
+            return Ok((ExecutionStatus::Filled, matched));
         }
         if resp.size_matched > Decimal::ZERO {
-            return Ok(ExecutionStatus::PartiallyFilled);
+            return Ok((ExecutionStatus::PartiallyFilled, matched));
         }
-        Ok(Self::map_status(&resp.status, true))
+        Ok((Self::map_status(&resp.status, true), matched))
     }
 
     async fn cancel_order(&self, order_id: &str) -> Result<(), ExecutionError> {
@@ -550,6 +554,9 @@ struct PolymarketOrderStatusResponse {
     status: Option<String>,
     #[serde(default)]
     filled_size: Option<String>,
+    /// Original order size when the API provides it (used for full-fill detection).
+    #[serde(default, alias = "size")]
+    original_size: Option<String>,
     #[serde(default)]
     avg_price: Option<String>,
     #[serde(default)]
@@ -1060,6 +1067,52 @@ impl PolymarketHttpExecutionClient {
             status: final_status,
         })
     }
+
+    async fn fetch_order_status_snapshot(&self, order_id: &str) -> Result<OrderStatusSnapshot, ExecutionError> {
+        let mut req = self
+            .http
+            .get(self.endpoint_url(&format!("data/order/{order_id}")))
+            .header("content-type", "application/json");
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ExecutionError::Backend(format!("get order status request failed: {e}")))?;
+        if !resp.status().is_success() {
+            let code = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ExecutionError::Backend(format!(
+                "get order status rejected: status={code}, body={body}"
+            )));
+        }
+
+        let parsed = resp
+            .json::<PolymarketOrderStatusResponse>()
+            .await
+            .map_err(|e| ExecutionError::Backend(format!("invalid status response: {e}")))?;
+
+        let mut filled = Self::parse_decimal_or(Decimal::ZERO, parsed.filled_size.clone());
+        if let Some(ref fills) = parsed.fills {
+            if !fills.is_empty() {
+                let (sum_size, _, _) =
+                    Self::summarize_status_fills(fills, Decimal::ZERO, Decimal::ZERO);
+                if sum_size > filled {
+                    filled = sum_size;
+                }
+            }
+        }
+
+        let requested = Self::parse_decimal_or(Decimal::ZERO, parsed.original_size.clone());
+        let mut st = Self::map_status(parsed.status.clone(), filled, requested);
+        if requested > Decimal::ZERO && filled >= requested {
+            st = ExecutionStatus::Filled;
+        }
+
+        Ok((st, filled))
+    }
 }
 
 #[async_trait]
@@ -1093,6 +1146,10 @@ impl ExecutionClient for PolymarketHttpExecutionClient {
             fills,
             signal: signal.clone(),
         })
+    }
+
+    async fn get_order_status(&self, order_id: &str) -> Result<OrderStatusSnapshot, ExecutionError> {
+        self.fetch_order_status_snapshot(order_id).await
     }
 }
 
