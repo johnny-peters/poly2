@@ -94,12 +94,14 @@ impl Strategy for ArbitrageStrategy {
                 price: snapshot.yes_best_ask,
                 size: self.config.order_size,
                 sell: false,
+                gtd_expiration: None,
             },
             OrderIntent {
                 side: Side::No,
                 price: snapshot.no_best_ask,
                 size: self.config.order_size,
                 sell: false,
+                gtd_expiration: None,
             },
         ];
 

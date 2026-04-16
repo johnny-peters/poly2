@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use polymarket_client_sdk::auth::ExposeSecret as _;
 use polymarket_client_sdk::auth::{LocalSigner as PmLocalSigner, Signer as _};
 use polymarket_client_sdk::clob::types::{Side as PmSide, SignatureType as PmSignatureType};
@@ -296,6 +296,7 @@ fn btc_candle_exit_signal(
             price,
             size,
             sell: true,
+            gtd_expiration: None,
         }],
         state: poly2::StrategyState::Implemented,
     }
@@ -642,6 +643,14 @@ async fn run_btc_candle_loop<C>(
         let mut bought_size = Decimal::ZERO;
         let mut entry_price = Decimal::ZERO;
 
+        // Random skip gate: require N+1 qualifying signals before entering.
+        // Helps avoid chasing the very first breakout of each round.
+        let mut entry_skip_remaining: i32 = {
+            let nanos = Utc::now().timestamp_subsec_nanos();
+            (nanos % 3) as i32 // 0, 1, or 2
+        };
+        println!("btc_candle: entry_skip_remaining={} (will skip first {} triggers)", entry_skip_remaining, entry_skip_remaining);
+
         'entry: loop {
             let now = Utc::now().timestamp();
             if now >= close_ts - 10 {
@@ -666,6 +675,17 @@ async fn run_btc_candle_loop<C>(
                     time::sleep(Duration::from_millis(poll_ms)).await;
                     continue 'entry;
                 };
+
+            // Signal qualifies — check skip gate
+            if entry_skip_remaining > 0 {
+                entry_skip_remaining -= 1;
+                println!(
+                    "btc_candle: SKIP entry signal (side={:?} ask={}), remaining skips={}",
+                    trigger_side, trigger_price, entry_skip_remaining
+                );
+                time::sleep(Duration::from_millis(poll_ms)).await;
+                continue 'entry;
+            }
 
             if trigger_price <= Decimal::ZERO {
                 time::sleep(Duration::from_millis(poll_ms)).await;
@@ -734,6 +754,7 @@ async fn run_btc_candle_loop<C>(
                     price: buy_price,
                     size,
                     sell: false,
+                    gtd_expiration: None,
                 }],
                 state: poly2::StrategyState::Implemented,
             };
@@ -821,7 +842,7 @@ async fn run_btc_candle_loop<C>(
                             } else {
                                 size
                             };
-                            bought_size = (raw_filled * Decimal::new(98, 2)).round_dp(2);
+                            bought_size = (raw_filled * Decimal::new(97, 2)).round_dp(2);
                             println!(
                                 "btc_candle: adjusted bought_size={} (matched={} requested={})",
                                 bought_size, raw_filled, size
@@ -853,6 +874,80 @@ async fn run_btc_candle_loop<C>(
             break 'entry;
         }
 
+        // --- Phase 4b: place GTD take-profit sell order on the exchange ---
+        let mut tp_order_id: Option<String> = None;
+        if bought_side.is_some() && bought_size > Decimal::ZERO {
+            let tp_expiration = DateTime::<Utc>::from_timestamp(close_ts, 0)
+                .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(5));
+            // Use a conservative size to avoid "not enough balance" from fee/rounding gaps.
+            // bought_size is already raw_filled*0.98; shrink further by 1% then floor to 2dp.
+            let mut tp_size = (bought_size * Decimal::new(97, 2)).round_dp(2);
+            let min_order = Decimal::from(5_u32);
+            if tp_size < min_order {
+                tp_size = min_order.min(bought_size);
+            }
+
+            let mut tp_placed = false;
+            for tp_attempt in 0..2_u32 {
+                let tp_signal = poly2::StrategySignal {
+                    strategy_id: StrategyId::ProbabilityTrading,
+                    market_id: market.market_id.clone(),
+                    yes_token_id: Some(market.up_token_id.clone()),
+                    no_token_id: Some(market.down_token_id.clone()),
+                    actions: vec![poly2::OrderIntent {
+                        side: bought_side.clone().unwrap(),
+                        price: take_profit_price,
+                        size: tp_size,
+                        sell: true,
+                        gtd_expiration: Some(tp_expiration),
+                    }],
+                    state: poly2::StrategyState::Implemented,
+                };
+                match execution.submit(&tp_signal).await {
+                    Ok(report) => {
+                        tp_order_id = report.order_ids.first().cloned();
+                        println!(
+                            "btc_candle: GTD TP order placed — id={:?} price={} size={} expires={}",
+                            tp_order_id, take_profit_price, tp_size,
+                            tp_expiration.to_rfc3339()
+                        );
+                        if matches!(report.status, ExecutionStatus::Filled) {
+                            println!("btc_candle: GTD TP order filled immediately!");
+                        }
+                        tp_placed = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        if tp_attempt == 0 && err_msg.contains("not enough balance") {
+                            if let Some(bal_str) = err_msg
+                                .split("balance: ")
+                                .nth(1)
+                                .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+                            {
+                                if let Ok(bal_raw) = bal_str.parse::<u64>() {
+                                    let actual = Decimal::new(bal_raw as i64, 6);
+                                    if actual > Decimal::ZERO {
+                                        tp_size = (actual * Decimal::new(99, 2)).round_dp(2);
+                                        println!(
+                                            "btc_candle: GTD TP balance={}, retrying with size={}",
+                                            actual, tp_size
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        eprintln!("btc_candle: failed to place GTD TP order: {e}, will use app-level TP");
+                        break;
+                    }
+                }
+            }
+            if !tp_placed {
+                eprintln!("btc_candle: GTD TP order not placed after retries, relying on app-level TP/SL");
+            }
+        }
+
         // --- Phase 5: if we bought, monitor for stop-loss / take-profit ---
         let mut exit_price = Decimal::ZERO;
         let mut exit_reason = "none";
@@ -867,6 +962,37 @@ async fn run_btc_candle_loop<C>(
             let mut last_known_bid = Decimal::ZERO;
 
             'exit: loop {
+                // Check if GTD TP order was filled by the exchange
+                if let Some(ref oid) = tp_order_id {
+                    match execution.get_order_status(oid).await {
+                        Ok((ExecutionStatus::Filled, matched)) => {
+                            println!(
+                                "btc_candle: GTD TP order FILLED by exchange! matched={} TP={}",
+                                matched, take_profit_price
+                            );
+                            exit_price = take_profit_price;
+                            exit_reason = "take_profit_gtd";
+                            if matched > Decimal::ZERO {
+                                pnl_shares = matched;
+                            }
+                            break 'exit;
+                        }
+                        Ok((ExecutionStatus::PartiallyFilled, matched)) => {
+                            if matched > Decimal::ZERO && matched >= bought_size {
+                                println!(
+                                    "btc_candle: GTD TP order fully matched={} (bought_size={}), treating as filled",
+                                    matched, bought_size
+                                );
+                                exit_price = take_profit_price;
+                                exit_reason = "take_profit_gtd";
+                                pnl_shares = matched;
+                                break 'exit;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 let now = Utc::now().timestamp();
                 let remaining = close_ts - now;
 
@@ -898,6 +1024,10 @@ async fn run_btc_candle_loop<C>(
                             "btc_candle: window closing in {}s, price {} >= near_certain {}, letting resolve",
                             remaining, current_ask, near_certain
                         );
+                        if let Some(ref oid) = tp_order_id {
+                            let _ = execution.cancel_order(oid).await;
+                            println!("btc_candle: cancelled GTD TP order (near_certain resolve)");
+                        }
                         exit_reason = "resolved_near_certain";
                         exit_price = Decimal::ONE;
                         break 'exit;
@@ -908,6 +1038,10 @@ async fn run_btc_candle_loop<C>(
                             "btc_candle: EARLY PROFIT EXIT — {}s left, bid {} > entry {}, selling to lock profit",
                             remaining, current_bid, entry_price
                         );
+                        if let Some(ref oid) = tp_order_id {
+                            let _ = execution.cancel_order(oid).await;
+                            println!("btc_candle: cancelled GTD TP order before early exit sell");
+                        }
                         exit_reason = "early_profit_exit";
 
                         let sell_out = execute_sell_with_retry(
@@ -938,6 +1072,10 @@ async fn run_btc_candle_loop<C>(
                     if remaining <= 5 {
                         let resolve_bid = if early_data_ok { current_bid } else { last_known_bid };
                         println!("btc_candle: window closing, bid {} (reliable={}) <= entry {}, letting resolve", resolve_bid, early_data_ok, entry_price);
+                        if let Some(ref oid) = tp_order_id {
+                            let _ = execution.cancel_order(oid).await;
+                            println!("btc_candle: cancelled GTD TP order (window closing)");
+                        }
                         exit_reason = "resolved_at_loss";
                         exit_price = resolve_bid.max(Decimal::ZERO);
                         break 'exit;
@@ -1011,6 +1149,32 @@ async fn run_btc_candle_loop<C>(
                 };
 
                 if trigger {
+                    // If app-level TP triggered, check if GTD order already filled first
+                    if exit_reason == "take_profit" {
+                        if let Some(ref oid) = tp_order_id {
+                            if let Ok((st, matched)) = execution.get_order_status(oid).await {
+                                if matches!(st, ExecutionStatus::Filled) || matched >= bought_size {
+                                    println!(
+                                        "btc_candle: GTD TP order already filled (matched={}), skipping manual sell",
+                                        matched
+                                    );
+                                    exit_price = take_profit_price;
+                                    exit_reason = "take_profit_gtd";
+                                    if matched > Decimal::ZERO {
+                                        pnl_shares = matched;
+                                    }
+                                    break 'exit;
+                                }
+                            }
+                        }
+                    }
+
+                    // Cancel the GTD TP order before placing a manual sell
+                    if let Some(ref oid) = tp_order_id {
+                        let _ = execution.cancel_order(oid).await;
+                        println!("btc_candle: cancelled GTD TP order before {} sell", exit_reason);
+                    }
+
                     let ws_bid = ws_cache.bid_for(&bought_token_id).await;
                     let sell_price = if ws_bid > Decimal::ZERO {
                         ws_bid

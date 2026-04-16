@@ -16,6 +16,9 @@ pub struct OrderIntent {
     /// True = sell (close) order; false = buy (open) order.
     #[allow(clippy::struct_field_names)]
     pub sell: bool,
+    /// When set, the order is submitted as GTD (Good-Til-Date) with this expiration.
+    /// The exchange automatically cancels the order at expiration if unfilled.
+    pub gtd_expiration: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug)]

@@ -6,7 +6,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use hmac::{Hmac, KeyInit, Mac as _};
 use polymarket_client_sdk::auth::{LocalSigner as PmLocalSigner, Signer as _};
 use polymarket_client_sdk::auth::{Normal as PmAuthNormal, state::Authenticated as PmAuthenticated};
-use polymarket_client_sdk::clob::types::{OrderStatusType as PmOrderStatusType, Side as PmSide};
+use polymarket_client_sdk::clob::types::{OrderStatusType as PmOrderStatusType, OrderType as PmOrderType, Side as PmSide};
 use polymarket_client_sdk::clob::Client as PmClobClient;
 use polymarket_client_sdk::types::{Decimal as PmDecimal, U256 as PmU256};
 use rust_decimal::Decimal;
@@ -330,13 +330,17 @@ impl ExecutionClient for PolymarketSdkExecutionClient {
                 .map_err(|e| ExecutionError::Backend(format!("invalid order size {}: {e}", action.size)))?;
             let side = if action.sell { PmSide::Sell } else { PmSide::Buy };
 
-            let order = self
+            let mut builder = self
                 .client
                 .limit_order()
                 .token_id(token_id)
                 .side(side)
                 .price(price)
-                .size(size)
+                .size(size);
+            if let Some(exp) = action.gtd_expiration {
+                builder = builder.order_type(PmOrderType::GTD).expiration(exp);
+            }
+            let order = builder
                 .build()
                 .await
                 .map_err(|e| ExecutionError::Backend(format!("build sdk order failed: {e}")))?;
@@ -1246,12 +1250,14 @@ mod tests {
                     price: Decimal::from_str("0.4").expect("invalid decimal"),
                     size: Decimal::from_str("1").expect("invalid decimal"),
                     sell: false,
+                    gtd_expiration: None,
                 },
                 OrderIntent {
                     side: Side::No,
                     price: Decimal::from_str("0.6").expect("invalid decimal"),
                     size: Decimal::from_str("1").expect("invalid decimal"),
                     sell: false,
+                    gtd_expiration: None,
                 },
             ],
             state: StrategyState::Implemented,
@@ -1292,6 +1298,7 @@ mod tests {
                 price: Decimal::from_str("0.4").expect("invalid decimal"),
                 size: Decimal::from_str("1").expect("invalid decimal"),
                 sell: false,
+                gtd_expiration: None,
             }],
             state: StrategyState::Implemented,
         };

@@ -160,6 +160,7 @@ where
                     price: yes_bid,
                     size: position.qty_yes,
                     sell: true,
+                    gtd_expiration: None,
                 });
             }
             if position.qty_no > Decimal::ZERO {
@@ -168,6 +169,7 @@ where
                     price: no_bid,
                     size: position.qty_no,
                     sell: true,
+                    gtd_expiration: None,
                 });
             }
             if actions.is_empty() {
