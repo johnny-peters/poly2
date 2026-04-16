@@ -649,6 +649,7 @@ async fn run_btc_candle_loop<C>(
             let nanos = Utc::now().timestamp_subsec_nanos();
             (nanos % 3) as i32 // 0, 1, or 2
         };
+        let mut last_skip_at: Option<tokio::time::Instant> = None;
         println!("btc_candle: entry_skip_remaining={} (will skip first {} triggers)", entry_skip_remaining, entry_skip_remaining);
 
         'entry: loop {
@@ -679,12 +680,27 @@ async fn run_btc_candle_loop<C>(
             // Signal qualifies — check skip gate
             if entry_skip_remaining > 0 {
                 entry_skip_remaining -= 1;
+                last_skip_at = Some(tokio::time::Instant::now());
                 println!(
                     "btc_candle: SKIP entry signal (side={:?} ask={}), remaining skips={}",
                     trigger_side, trigger_price, entry_skip_remaining
                 );
                 time::sleep(Duration::from_millis(poll_ms)).await;
                 continue 'entry;
+            }
+
+            if let Some(skipped_at) = last_skip_at {
+                let elapsed = skipped_at.elapsed();
+                let cooldown = Duration::from_secs(10);
+                if elapsed < cooldown {
+                    let wait = cooldown - elapsed;
+                    println!(
+                        "btc_candle: post-skip cooldown, waiting {:.1}s before entry",
+                        wait.as_secs_f64()
+                    );
+                    time::sleep(wait).await;
+                }
+                last_skip_at = None;
             }
 
             if trigger_price <= Decimal::ZERO {
