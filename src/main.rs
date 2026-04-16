@@ -646,8 +646,11 @@ async fn run_btc_candle_loop<C>(
         // Random skip gate: require N+1 qualifying signals before entering.
         // Helps avoid chasing the very first breakout of each round.
         let mut entry_skip_remaining: i32 = {
-            let nanos = Utc::now().timestamp_subsec_nanos();
-            (nanos % 3) as i32 // 0, 1, or 2
+            let nanos = Utc::now().timestamp_subsec_nanos() as u64;
+            let pid = std::process::id() as u64;
+            let mut h = nanos.wrapping_mul(6364136223846793005).wrapping_add(pid);
+            h ^= h >> 17;
+            (h % 3) as i32 // 0, 1, or 2
         };
         let mut last_skip_at: Option<tokio::time::Instant> = None;
         println!("btc_candle: entry_skip_remaining={} (will skip first {} triggers)", entry_skip_remaining, entry_skip_remaining);
