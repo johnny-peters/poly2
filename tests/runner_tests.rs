@@ -13,6 +13,8 @@ use poly2::{
 fn build_snapshot() -> MarketSnapshot {
     MarketSnapshot {
         market_id: "runner-m1".to_string(),
+        yes_token_id: Some("runner-m1-yes".to_string()),
+        no_token_id: Some("runner-m1-no".to_string()),
         yes_best_bid: Decimal::from_str("0.49").expect("invalid decimal"),
         yes_best_ask: Decimal::from_str("0.48").expect("invalid decimal"),
         no_best_bid: Decimal::from_str("0.50").expect("invalid decimal"),

@@ -11,6 +11,8 @@ fn sample_signal() -> StrategySignal {
     StrategySignal {
         strategy_id: StrategyId::Arbitrage,
         market_id: "pm-1".to_string(),
+        yes_token_id: None,
+        no_token_id: None,
         actions: vec![],
         state: StrategyState::Implemented,
     }

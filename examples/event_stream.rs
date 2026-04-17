@@ -52,6 +52,8 @@ async fn main() -> anyhow::Result<()> {
 
     let snapshot = MarketSnapshot {
         market_id: "event-market".to_string(),
+        yes_token_id: Some("event-market-yes".to_string()),
+        no_token_id: Some("event-market-no".to_string()),
         yes_best_bid: Decimal::from_str("0.49")?,
         yes_best_ask: Decimal::from_str("0.48")?,
         no_best_bid: Decimal::from_str("0.50")?,

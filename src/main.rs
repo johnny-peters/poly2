@@ -267,6 +267,12 @@ pub(crate) fn read_u64_env_or(dotenv_path: &Path, key: &str, default_value: u64)
         .unwrap_or(default_value)
 }
 
+pub(crate) fn read_f64_env_or(dotenv_path: &Path, key: &str, default_value: f64) -> f64 {
+    resolve_runtime_var(key, dotenv_path)
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(default_value)
+}
+
 // Plan A/B/C implementations are in plan_a.rs, plan_b.rs, plan_c.rs respectively.
 
 #[tokio::main]
@@ -406,14 +412,40 @@ async fn main() -> anyhow::Result<()> {
         external_probability: None,
     };
 
-    let use_plan_b = args.iter().any(|a| a == "plan-b" || a == "plan_b" || a == "planb");
-    let use_plan_c = args.iter().any(|a| a == "plan-c" || a == "plan_c" || a == "planc");
-    if use_plan_c {
-        println!("strategy=plan_c (智能跟单)");
-    } else if use_plan_b {
-        println!("strategy=plan_b (双边对冲)");
+    let cli_plan_a = args.iter().any(|a| a == "plan-a" || a == "plan_a" || a == "plana");
+    let cli_plan_b = args.iter().any(|a| a == "plan-b" || a == "plan_b" || a == "planb");
+    let cli_plan_c = args.iter().any(|a| a == "plan-c" || a == "plan_c" || a == "planc");
+
+    let (use_plan_b, use_plan_c, plan_source) = if cli_plan_a {
+        (false, false, "cli")
+    } else if cli_plan_b {
+        (true, false, "cli")
+    } else if cli_plan_c {
+        (false, true, "cli")
     } else {
-        println!("strategy=plan_a (单边趋势)");
+        match resolve_runtime_var("DEFAULT_PLAN", dotenv_path)
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("plan-a") | Some("plan_a") | Some("plana") | Some("a") => (false, false, "env"),
+            Some("plan-b") | Some("plan_b") | Some("planb") | Some("b") => (true, false, "env"),
+            Some("plan-c") | Some("plan_c") | Some("planc") | Some("c") => (false, true, "env"),
+            Some(other) if !other.is_empty() => {
+                eprintln!(
+                    "warn: DEFAULT_PLAN='{other}' not recognised, falling back to plan-a (accepted: plan-a|plan-b|plan-c)"
+                );
+                (false, false, "default")
+            }
+            _ => (false, false, "default"),
+        }
+    };
+
+    if use_plan_c {
+        println!("strategy=plan_c (智能跟单) [source={plan_source}]");
+    } else if use_plan_b {
+        println!("strategy=plan_b (双边对冲) [source={plan_source}]");
+    } else {
+        println!("strategy=plan_a (单边趋势) [source={plan_source}]");
     }
 
     if let Some(http_url) = &execution_settings.polymarket_http_url {

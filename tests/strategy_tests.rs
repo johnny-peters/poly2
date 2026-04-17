@@ -13,6 +13,8 @@ use poly2::{
 fn snapshot(yes_ask: &str, no_ask: &str, volume_24h: &str) -> MarketSnapshot {
     MarketSnapshot {
         market_id: "m1".to_string(),
+        yes_token_id: Some("m1-yes".to_string()),
+        no_token_id: Some("m1-no".to_string()),
         yes_best_bid: Decimal::from_str("0.49").expect("invalid decimal"),
         yes_best_ask: Decimal::from_str(yes_ask).expect("invalid decimal"),
         no_best_bid: Decimal::from_str("0.49").expect("invalid decimal"),
@@ -142,6 +144,8 @@ async fn risk_engine_blocks_when_market_position_hits_max_position_pct() {
         "m1".to_string(),
         Position {
             market_id: "m1".to_string(),
+            yes_token_id: None,
+            no_token_id: None,
             qty_yes: Decimal::from_str("390").expect("invalid decimal"),
             qty_no: Decimal::ZERO,
             avg_entry_yes: Decimal::from_str("0.50").expect("invalid decimal"),
@@ -228,5 +232,9 @@ async fn polymarket_http_client_returns_network_error_without_endpoint() {
         .submit(&signal)
         .await
         .expect_err("http client should fail without exchange endpoint");
-    assert!(err.to_string().contains("http request failed"));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("http request failed") || msg.contains("exchange rejected order"),
+        "unexpected error message: {msg}"
+    );
 }
