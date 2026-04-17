@@ -13,6 +13,42 @@ use crate::{
     read_f64_env_or, read_u64_env_or, resolve_runtime_var,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitMode {
+    LeaderWithSafety,
+    LeaderOnly,
+    LocalOnly,
+}
+
+fn parse_exit_mode(raw: Option<String>) -> ExitMode {
+    let normalized = raw
+        .unwrap_or_else(|| "leader_with_safety".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "leader_with_safety" | "leader-with-safety" | "leader_safety" | "default" | "" => {
+            ExitMode::LeaderWithSafety
+        }
+        "leader_only" | "leader-only" | "leader" => ExitMode::LeaderOnly,
+        "local_only" | "local-only" | "local" => ExitMode::LocalOnly,
+        other => {
+            eprintln!(
+                "plan_c: warn: PLAN_C_EXIT_MODE='{}' not recognised, using leader_with_safety",
+                other
+            );
+            ExitMode::LeaderWithSafety
+        }
+    }
+}
+
+fn mode_has_local_safety(mode: ExitMode) -> bool {
+    matches!(mode, ExitMode::LeaderWithSafety | ExitMode::LocalOnly)
+}
+
+fn mode_has_leader_exit(mode: ExitMode) -> bool {
+    matches!(mode, ExitMode::LeaderWithSafety | ExitMode::LeaderOnly)
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[allow(dead_code)]
 struct LeaderboardEntry {
@@ -97,6 +133,299 @@ struct CopiedPosition {
     entry_price: Decimal,
     size: Decimal,
     opened_at: i64,
+    leader_buy_ts: i64,
+}
+
+// ----------------------------------------------------------------------------
+// Persistence & on-chain reconciliation
+// ----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct PersistedPosition {
+    trader: String,
+    market_id: String,
+    token_id: String,
+    side: String, // "Yes" | "No"
+    entry_price: String,
+    size: String,
+    opened_at: i64,
+    leader_buy_ts: i64,
+}
+
+fn side_to_persisted(s: &Side) -> &'static str {
+    match s {
+        Side::Yes => "Yes",
+        Side::No => "No",
+    }
+}
+
+fn side_from_persisted(s: &str) -> Side {
+    match s.trim() {
+        "No" | "no" | "NO" => Side::No,
+        _ => Side::Yes,
+    }
+}
+
+impl PersistedPosition {
+    fn from_position(p: &CopiedPosition) -> Self {
+        Self {
+            trader: p.trader.clone(),
+            market_id: p.market_id.clone(),
+            token_id: p.token_id.clone(),
+            side: side_to_persisted(&p.side).to_string(),
+            entry_price: p.entry_price.to_string(),
+            size: p.size.to_string(),
+            opened_at: p.opened_at,
+            leader_buy_ts: p.leader_buy_ts,
+        }
+    }
+
+    fn to_position(&self) -> Option<CopiedPosition> {
+        let entry_price = Decimal::from_str(self.entry_price.trim()).ok()?;
+        let size = Decimal::from_str(self.size.trim()).ok()?;
+        Some(CopiedPosition {
+            trader: self.trader.clone(),
+            market_id: self.market_id.clone(),
+            token_id: self.token_id.clone(),
+            side: side_from_persisted(&self.side),
+            entry_price,
+            size,
+            opened_at: self.opened_at,
+            leader_buy_ts: self.leader_buy_ts,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct PlanCState {
+    #[serde(default)]
+    positions: Vec<PersistedPosition>,
+    #[serde(default)]
+    last_seen_trades: HashMap<String, i64>,
+    #[serde(default)]
+    daily_pnl: String,
+    #[serde(default)]
+    saved_at: String,
+}
+
+fn save_plan_c_state(
+    path: &Path,
+    positions: &[CopiedPosition],
+    last_seen_trades: &HashMap<String, i64>,
+    daily_pnl: Decimal,
+) {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("plan_c: failed to create state dir {}: {e}", parent.display());
+                return;
+            }
+        }
+    }
+    let state = PlanCState {
+        positions: positions.iter().map(PersistedPosition::from_position).collect(),
+        last_seen_trades: last_seen_trades.clone(),
+        daily_pnl: daily_pnl.to_string(),
+        saved_at: Utc::now().to_rfc3339(),
+    };
+    match serde_json::to_string_pretty(&state) {
+        Ok(json) => {
+            let tmp = path.with_extension("json.tmp");
+            if let Err(e) = std::fs::write(&tmp, &json) {
+                eprintln!(
+                    "plan_c: failed to write state tmp {}: {e}",
+                    tmp.display()
+                );
+                return;
+            }
+            if let Err(e) = std::fs::rename(&tmp, path) {
+                // On Windows rename onto existing file may fail; fall back to direct write.
+                if let Err(e2) = std::fs::write(path, &json) {
+                    eprintln!(
+                        "plan_c: failed to persist state to {}: rename err={e}, write err={e2}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        Err(e) => eprintln!("plan_c: failed to serialise state: {e}"),
+    }
+}
+
+fn load_plan_c_state(path: &Path) -> PlanCState {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return PlanCState::default();
+    };
+    match serde_json::from_str::<PlanCState>(&raw) {
+        Ok(state) => state,
+        Err(e) => {
+            eprintln!(
+                "plan_c: failed to parse state file {}: {e} — starting with empty state",
+                path.display()
+            );
+            PlanCState::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
+struct OnchainPosition {
+    #[serde(default)]
+    asset: Option<String>,
+    #[serde(default, alias = "conditionId")]
+    condition_id: Option<String>,
+    #[serde(default)]
+    size: Option<f64>,
+    #[serde(default, alias = "avgPrice")]
+    avg_price: Option<f64>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    outcome: Option<String>,
+    #[serde(default)]
+    redeemable: Option<bool>,
+    #[serde(default, alias = "curPrice")]
+    cur_price: Option<f64>,
+}
+
+async fn fetch_onchain_positions(
+    http: &reqwest::Client,
+    wallet: &str,
+) -> anyhow::Result<Vec<OnchainPosition>> {
+    let url = format!(
+        "https://data-api.polymarket.com/positions?user={}&sizeThreshold=0.01",
+        wallet
+    );
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("positions request failed for {}", wallet))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "positions request failed for {}: status={}",
+            wallet,
+            resp.status()
+        ));
+    }
+    let positions: Vec<OnchainPosition> =
+        resp.json().await.context("positions parse failed")?;
+    Ok(positions)
+}
+
+fn f64_to_decimal(v: f64) -> Option<Decimal> {
+    // Use a string formatted to a fixed precision to avoid scientific notation
+    // and to tolerate floating-point noise.
+    if !v.is_finite() {
+        return None;
+    }
+    Decimal::from_str(&format!("{:.8}", v)).ok()
+}
+
+/// Reconcile locally cached positions with truth from the Polymarket data API.
+/// - Cached AND on-chain → keep cache (metadata is better) but clamp size downward
+///   to the on-chain value (so we don't try to sell more than we actually own).
+/// - Cached but not on-chain → drop (was sold/redeemed outside this bot).
+/// - On-chain but not cached → adopt as "orphan" position (no trader metadata;
+///   only local SL/TP can manage it).
+fn reconcile_positions(
+    cached: Vec<CopiedPosition>,
+    onchain: &[OnchainPosition],
+) -> Vec<CopiedPosition> {
+    let mut onchain_map: HashMap<String, &OnchainPosition> = HashMap::new();
+    for p in onchain {
+        let Some(asset) = p.asset.as_deref().map(str::trim) else {
+            continue;
+        };
+        if asset.is_empty() {
+            continue;
+        }
+        if p.size.unwrap_or(0.0) <= 0.0 {
+            continue;
+        }
+        onchain_map.insert(asset.to_string(), p);
+    }
+
+    let mut reconciled: Vec<CopiedPosition> = Vec::new();
+    for mut pos in cached {
+        match onchain_map.remove(&pos.token_id) {
+            Some(on) => {
+                let onchain_size = on.size.unwrap_or(0.0);
+                if let Some(onchain_dec) = f64_to_decimal(onchain_size) {
+                    if onchain_dec > Decimal::ZERO && onchain_dec < pos.size {
+                        println!(
+                            "plan_c: reconcile — shrinking cached size for market={} token={} from {} to {} (on-chain)",
+                            pos.market_id,
+                            short_token(&pos.token_id),
+                            pos.size,
+                            onchain_dec
+                        );
+                        pos.size = onchain_dec;
+                    }
+                }
+                reconciled.push(pos);
+            }
+            None => {
+                println!(
+                    "plan_c: reconcile — dropping cached position (no longer on-chain): market={} token={} size={}",
+                    pos.market_id,
+                    short_token(&pos.token_id),
+                    pos.size
+                );
+            }
+        }
+    }
+
+    for (asset, p) in onchain_map {
+        if p.redeemable.unwrap_or(false) {
+            // Already resolved — bot shouldn't try to sell it.
+            continue;
+        }
+        let cid = p
+            .condition_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        if cid.is_empty() {
+            continue;
+        }
+        let size_dec = match f64_to_decimal(p.size.unwrap_or(0.0)) {
+            Some(v) if v > Decimal::ZERO => v,
+            _ => continue,
+        };
+        let entry_dec = f64_to_decimal(p.avg_price.unwrap_or(0.5))
+            .unwrap_or_else(|| Decimal::new(50, 2))
+            .round_dp(2);
+        let title = p.title.as_deref().unwrap_or(&cid);
+        let outcome = p.outcome.as_deref().unwrap_or("?");
+        println!(
+            "plan_c: reconcile — adopting on-chain position as orphan: \"{}\" outcome={} token={} size={} avg={} (local SL/TP only)",
+            title,
+            outcome,
+            short_token(&asset),
+            size_dec,
+            entry_dec
+        );
+        reconciled.push(CopiedPosition {
+            trader: String::new(),
+            market_id: cid,
+            token_id: asset,
+            side: Side::Yes,
+            entry_price: entry_dec,
+            size: size_dec,
+            opened_at: Utc::now().timestamp(),
+            leader_buy_ts: 0,
+        });
+    }
+
+    reconciled
+}
+
+fn short_token(token_id: &str) -> String {
+    let end = 12.min(token_id.len());
+    format!("{}…", &token_id[..end])
 }
 
 fn normalize_leaderboard_period(raw: &str) -> &'static str {
@@ -604,6 +933,9 @@ pub(crate) async fn run_plan_c_loop<C>(
     );
     let max_per_trader = read_u64_env_or(dotenv_path, "PLAN_C_MAX_PER_TRADER", 2) as usize;
     let refresh_leaders_secs = read_u64_env_or(dotenv_path, "PLAN_C_REFRESH_LEADERS_SECS", 3600);
+    let exit_mode = parse_exit_mode(resolve_runtime_var("PLAN_C_EXIT_MODE", dotenv_path));
+    let leader_sell_max_age_secs =
+        read_u64_env_or(dotenv_path, "PLAN_C_LEADER_SELL_MAX_AGE_SECS", 300) as i64;
 
     println!("plan_c: leaderboard_limit={leaderboard_limit} period={period}");
     println!("plan_c: min_pnl={min_pnl} min_volume={min_volume}");
@@ -614,6 +946,10 @@ pub(crate) async fn run_plan_c_loop<C>(
     println!("plan_c: order_usd={order_usd} poll_secs={poll_secs}");
     println!("plan_c: stop_loss={stop_loss_pct} take_profit={take_profit_pct} max_positions={max_positions}");
     println!("plan_c: buy_slippage={buy_slippage} max_per_trader={max_per_trader} refresh_leaders={refresh_leaders_secs}s");
+    println!(
+        "plan_c: exit_mode={:?} leader_sell_max_age_secs={leader_sell_max_age_secs}",
+        exit_mode
+    );
 
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -621,11 +957,71 @@ pub(crate) async fn run_plan_c_loop<C>(
         .build()
         .expect("plan_c: http client build failed");
 
+    // ------------------------------------------------------------------
+    // State persistence & on-chain reconciliation
+    // ------------------------------------------------------------------
+    let state_path_str = resolve_runtime_var("PLAN_C_STATE_PATH", dotenv_path)
+        .unwrap_or_else(|| "data/plan_c_state.json".to_string());
+    let state_path_buf = std::path::PathBuf::from(&state_path_str);
+    let state_path = state_path_buf.as_path();
+    let proxy_wallet = resolve_runtime_var("PROXY_WALLET", dotenv_path)
+        .or_else(|| resolve_runtime_var("PM_FUNDER", dotenv_path))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    println!(
+        "plan_c: state_path={} proxy_wallet={}",
+        state_path.display(),
+        proxy_wallet.as_deref().unwrap_or("(none)")
+    );
+
+    let persisted = load_plan_c_state(state_path);
+    let mut open_positions: Vec<CopiedPosition> = persisted
+        .positions
+        .iter()
+        .filter_map(PersistedPosition::to_position)
+        .collect();
+    let mut last_seen_trades: HashMap<String, i64> = persisted.last_seen_trades.clone();
+    let loaded_daily_pnl = Decimal::from_str(persisted.daily_pnl.trim()).ok();
+    let mut daily_pnl = loaded_daily_pnl.unwrap_or(context.risk.daily_pnl);
+    println!(
+        "plan_c: restored {} position(s), {} trader watermark(s), daily_pnl={}",
+        open_positions.len(),
+        last_seen_trades.len(),
+        daily_pnl
+    );
+
+    // Reconcile with on-chain truth (if a wallet is configured).
+    if let Some(wallet) = proxy_wallet.as_deref() {
+        match fetch_onchain_positions(&http, wallet).await {
+            Ok(onchain) => {
+                println!(
+                    "plan_c: fetched {} on-chain position(s) for reconciliation",
+                    onchain.len()
+                );
+                open_positions = reconcile_positions(open_positions, &onchain);
+                println!(
+                    "plan_c: reconciled open_positions={} (of which {} are orphans with no trader metadata)",
+                    open_positions.len(),
+                    open_positions.iter().filter(|p| p.trader.is_empty()).count()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "plan_c: on-chain reconciliation skipped (fetch failed): {e} — proceeding with cached state only"
+                );
+            }
+        }
+    } else {
+        eprintln!(
+            "plan_c: PROXY_WALLET/PM_FUNDER not configured — skipping on-chain reconciliation"
+        );
+    }
+
+    // Persist the reconciled state so the file reflects reality on next restart.
+    save_plan_c_state(state_path, &open_positions, &last_seen_trades, daily_pnl);
+
     let mut qualified_traders: Vec<QualifiedTrader> = Vec::new();
     let mut last_leader_refresh: i64 = 0;
-    let mut open_positions: Vec<CopiedPosition> = Vec::new();
-    let mut daily_pnl = context.risk.daily_pnl;
-    let mut last_seen_trades: HashMap<String, i64> = HashMap::new();
     let round_log_path = Path::new("data/plan_c_rounds.jsonl");
 
     let mut loop_idx: u64 = 0;
@@ -663,16 +1059,50 @@ pub(crate) async fn run_plan_c_loop<C>(
                 time::sleep(Duration::from_secs(300)).await;
                 continue;
             }
+        }
 
-            for trader in &qualified_traders {
-                if !last_seen_trades.contains_key(&trader.address) {
-                    let latest_ts = match fetch_user_trades(&http, &trader.address, 1).await {
-                        Ok(t) => t.first().and_then(|t| t.timestamp).unwrap_or(now),
-                        Err(_) => now,
-                    };
-                    last_seen_trades.insert(trader.address.clone(), latest_ts);
+        // Fetch trades once per round for the union of:
+        // - all qualified traders (entry decisions)
+        // - traders that currently have open positions (exit decisions)
+        let mut leader_addrs: Vec<String> = Vec::new();
+        for t in &qualified_traders {
+            leader_addrs.push(t.address.clone());
+        }
+        for p in &open_positions {
+            // Orphan positions (reconciled from chain) have no trader — skip them
+            // to avoid wasted trades-API calls; they can only be managed by local SL/TP.
+            if !p.trader.is_empty() {
+                leader_addrs.push(p.trader.clone());
+            }
+        }
+        leader_addrs.sort();
+        leader_addrs.dedup();
+
+        let mut trades_map: HashMap<String, Vec<TradeRecord>> = HashMap::new();
+        for addr in &leader_addrs {
+            // 50 is enough to see recent BUY/SELL events without hammering the API.
+            match fetch_user_trades(&http, addr, 50).await {
+                Ok(trades) => {
+                    trades_map.insert(addr.clone(), trades);
+                }
+                Err(err) => {
+                    eprintln!("plan_c: fetch_trades failed for {addr}: {err}");
                 }
             }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // Initialise last_seen watermark for newly qualified traders from the fetched trades.
+        // This prevents copying historical buys when a trader is first discovered.
+        for trader in &qualified_traders {
+            if last_seen_trades.contains_key(&trader.address) {
+                continue;
+            }
+            let latest_ts = trades_map
+                .get(&trader.address)
+                .and_then(|v| v.iter().filter_map(|t| t.timestamp).max())
+                .unwrap_or(now);
+            last_seen_trades.insert(trader.address.clone(), latest_ts);
         }
 
         let mut closed_indices = Vec::new();
@@ -688,7 +1118,92 @@ pub(crate) async fn run_plan_c_loop<C>(
                 Decimal::ZERO
             };
 
-            if pnl_pct <= -stop_loss_pct {
+            // 1) Leader exit (SELL) detection (optional by exit mode)
+            if mode_has_leader_exit(exit_mode) {
+                let now_ts = Utc::now().timestamp();
+                let leader_sold = trades_map
+                    .get(&pos.trader)
+                    .map(|trades| {
+                        trades.iter().any(|t| {
+                            let is_sell = t
+                                .side
+                                .as_deref()
+                                .map(|s| s.eq_ignore_ascii_case("SELL"))
+                                .unwrap_or(false);
+                            if !is_sell {
+                                return false;
+                            }
+                            let ts = t.timestamp.unwrap_or(0);
+                            if ts <= pos.leader_buy_ts {
+                                return false;
+                            }
+                            if leader_sell_max_age_secs > 0
+                                && (now_ts - ts) > leader_sell_max_age_secs
+                            {
+                                return false;
+                            }
+                            t.asset
+                                .as_deref()
+                                .map(|a| a.trim().eq(pos.token_id.as_str()))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+
+                if leader_sold {
+                    println!(
+                        "plan_c: LEADER EXIT — market={} bid={} entry={} pnl={:.2}%",
+                        pos.market_id,
+                        current_bid,
+                        pos.entry_price,
+                        pnl_pct * Decimal::from(100_u32)
+                    );
+
+                    let sell_price =
+                        (current_bid - buy_slippage).max(Decimal::new(1, 2)).round_dp(2);
+                    let signal = poly2::StrategySignal {
+                        strategy_id: StrategyId::ProbabilityTrading,
+                        market_id: pos.market_id.clone(),
+                        yes_token_id: Some(pos.token_id.clone()),
+                        no_token_id: None,
+                        actions: vec![poly2::OrderIntent {
+                            side: pos.side.clone(),
+                            price: sell_price,
+                            size: pos.size,
+                            sell: true,
+                            gtd_expiration: None,
+                        }],
+                        state: poly2::StrategyState::Implemented,
+                    };
+                    match execution.submit(&signal).await {
+                        Ok(report) => {
+                            print_execution_report(&report);
+                            let round_pnl = (current_bid - pos.entry_price) * pos.size;
+                            daily_pnl += round_pnl;
+                            append_round_record(
+                                round_log_path,
+                                loop_idx,
+                                &pos.market_id,
+                                format!("copy_{}", pos.trader),
+                                pos.entry_price,
+                                current_bid,
+                                pos.size,
+                                round_pnl,
+                                "leader_sell",
+                            );
+                        }
+                        Err(e) => eprintln!("plan_c: sell (leader exit) failed: {e}"),
+                    }
+                    closed_indices.push(idx);
+                    continue;
+                }
+            }
+
+            // 2) Local SL/TP safety net (optional by exit mode).
+            //    Orphan positions (reconciled from chain with no trader) always need
+            //    local safety — otherwise nobody is watching them.
+            let local_safety_active = mode_has_local_safety(exit_mode) || pos.trader.is_empty();
+            if local_safety_active && pnl_pct <= -stop_loss_pct {
                 println!(
                     "plan_c: STOP LOSS — market={} bid={} entry={} pnl={:.2}%",
                     pos.market_id, current_bid, pos.entry_price,
@@ -724,7 +1239,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                     Err(e) => eprintln!("plan_c: sell (stop loss) failed: {e}"),
                 }
                 closed_indices.push(idx);
-            } else if pnl_pct >= take_profit_pct {
+            } else if local_safety_active && pnl_pct >= take_profit_pct {
                 println!(
                     "plan_c: TAKE PROFIT — market={} bid={} entry={} pnl={:.2}%",
                     pos.market_id, current_bid, pos.entry_price,
@@ -762,9 +1277,13 @@ pub(crate) async fn run_plan_c_loop<C>(
                 closed_indices.push(idx);
             }
         }
+        let any_closed = !closed_indices.is_empty();
         closed_indices.sort_unstable_by(|a, b| b.cmp(a));
         for idx in closed_indices {
             open_positions.remove(idx);
+        }
+        if any_closed {
+            save_plan_c_state(state_path, &open_positions, &last_seen_trades, daily_pnl);
         }
 
         if open_positions.len() < max_positions {
@@ -779,12 +1298,8 @@ pub(crate) async fn run_plan_c_loop<C>(
 
             for (idx, trader) in qualified_traders.iter().enumerate() {
                 let last_ts = last_seen_trades.get(&trader.address).copied().unwrap_or(0);
-                let trades = match fetch_user_trades(&http, &trader.address, 20).await {
-                    Ok(t) => t,
-                    Err(err) => {
-                        eprintln!("plan_c: fetch_trades failed for {}: {err}", trader.user_name);
-                        continue;
-                    }
+                let Some(trades) = trades_map.get(&trader.address) else {
+                    continue;
                 };
 
                 for t in trades.iter() {
@@ -808,8 +1323,6 @@ pub(crate) async fn run_plan_c_loop<C>(
                     }
                     pending.push((trader.score, idx, t.clone()));
                 }
-
-                tokio::time::sleep(Duration::from_millis(200)).await;
             }
 
             // Step 2: prioritise by trader score (descending). Ties preserve insertion
@@ -953,8 +1466,15 @@ pub(crate) async fn run_plan_c_loop<C>(
                                 entry_price: buy_price,
                                 size: actual_size,
                                 opened_at: Utc::now().timestamp(),
+                                leader_buy_ts: trade_ts,
                             });
                             println!("plan_c: position opened — {} open now", open_positions.len());
+                            save_plan_c_state(
+                                state_path,
+                                &open_positions,
+                                &last_seen_trades,
+                                daily_pnl,
+                            );
                         }
                     }
                     Err(e) => {
@@ -972,8 +1492,13 @@ pub(crate) async fn run_plan_c_loop<C>(
             }
         }
 
+        // End-of-iteration fallback save: captures last_seen_trades / daily_pnl
+        // updates even when positions didn't change this round.
+        save_plan_c_state(state_path, &open_positions, &last_seen_trades, daily_pnl);
+
         println!(
-            "plan_c: poll #{loop_idx} done — positions={}/{} daily_pnl={} tracking={} traders — sleeping {}s",
+            "[{}] plan_c: poll #{loop_idx} done — positions={}/{} daily_pnl={} tracking={} traders — sleeping {}s",
+            chrono::Local::now().format("%m/%d %H:%M:%S"),
             open_positions.len(),
             max_positions,
             daily_pnl,
