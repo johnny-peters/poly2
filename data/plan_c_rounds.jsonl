@@ -8,3 +8,4 @@
 {"entry":"0.58","exit":"0.22","market":"0xe30e0f410149757fd65abac14e44dd755d8d8732e4da7ac897c170f4ba2aa737","pnl":"-6.240348","reason":"stop_loss","round":1,"side":"copy_","size":"17.3343","ts":"2026-04-18T08:32:18.427448500+00:00"}
 {"entry":"0.86","exit":"0","market":"0xe7d89be5546b58f9c43787412d53f84db14650cc2bb69989ee9f2610dc5bc405","pnl":"-4.812904","reason":"redeemed","round":143,"side":"copy_","size":"5.5964","ts":"2026-04-18T09:44:57.148580+00:00"}
 {"entry":"0.24","exit":"0.2","market":"0x1507c50c86fb307e4f1acd9d740b2be66d98773f90d161e94907d8ef2c5699b3","pnl":"-0.7692","reason":"stop_loss","round":390,"side":"copy_","size":"19.23","ts":"2026-04-18T11:48:50.480604400+00:00"}
+{"entry":"0.34","exit":"0.55","market":"0x862ced9c16fa2f73b34dfd62eefafdef8dd25f1b54b2f7d4756cc0442f2099b6","pnl":"2.9379","reason":"take_profit","round":1,"side":"copy_","size":"13.99","ts":"2026-04-18T12:11:30.350925700+00:00"}

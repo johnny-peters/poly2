@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context};
 use chrono::Utc;
 use futures::future::join_all;
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
@@ -50,6 +50,29 @@ fn mode_has_local_safety(mode: ExitMode) -> bool {
 
 fn mode_has_leader_exit(mode: ExitMode) -> bool {
     matches!(mode, ExitMode::LeaderWithSafety | ExitMode::LeaderOnly)
+}
+
+/// Build a conservative sell size that is guaranteed to be <= the actual
+/// on-chain balance for a position, even when the local `pos.size` tracks the
+/// on-chain size up to a few micro-units of precision drift.
+///
+/// This prevents the Polymarket CLOB from rejecting a close with
+/// `not enough balance / allowance` errors such as
+/// `balance: 14007060, order amount: 14010000` (observed off-by-<=0.003 share)
+/// by flooring to 2dp and shaving a single 0.01-share "dust" margin.
+/// The worst-case loss is 0.01 × sell_price (< $0.01 per exit), which is
+/// negligible compared with repeatedly failing to exit a position.
+fn conservative_sell_size(raw: Decimal) -> Decimal {
+    let min_size = Decimal::new(1, 2); // 0.01 shares
+    let floored = raw.round_dp_with_strategy(2, RoundingStrategy::ToZero);
+    let shaved = floored - min_size;
+    if shaved <= Decimal::ZERO {
+        // Position too small to safely shave — fall back to the floored value
+        // and let the exchange decide; at that size we prefer trying over giving up.
+        floored.max(min_size)
+    } else {
+        shaved
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -394,8 +417,19 @@ struct PlanCState {
     last_seen_trades: HashMap<String, i64>,
     #[serde(default)]
     daily_pnl: String,
+    /// UTC calendar date (YYYY-MM-DD) that `daily_pnl` was accrued on.
+    /// Empty on legacy state files — in that case we conservatively start
+    /// fresh on the next load (daily_pnl reset to 0).
+    #[serde(default)]
+    daily_pnl_date: String,
     #[serde(default)]
     saved_at: String,
+}
+
+/// UTC calendar date formatted as `YYYY-MM-DD`. Used to decide when a new
+/// trading day has started and the `daily_pnl` risk counter should reset.
+fn current_utc_date_str() -> String {
+    Utc::now().date_naive().to_string()
 }
 
 fn save_plan_c_state(
@@ -404,6 +438,7 @@ fn save_plan_c_state(
     pending_buys: &[PendingBuy],
     last_seen_trades: &HashMap<String, i64>,
     daily_pnl: Decimal,
+    daily_pnl_date: &str,
 ) {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -421,6 +456,7 @@ fn save_plan_c_state(
             .collect(),
         last_seen_trades: last_seen_trades.clone(),
         daily_pnl: daily_pnl.to_string(),
+        daily_pnl_date: daily_pnl_date.to_string(),
         saved_at: Utc::now().to_rfc3339(),
     };
     match serde_json::to_string_pretty(&state) {
@@ -2572,6 +2608,35 @@ pub(crate) async fn run_plan_c_loop<C>(
     let mut last_seen_trades: HashMap<String, i64> = persisted.last_seen_trades.clone();
     let loaded_daily_pnl = Decimal::from_str(persisted.daily_pnl.trim()).ok();
     let mut daily_pnl = loaded_daily_pnl.unwrap_or(context.risk.daily_pnl);
+
+    // Roll over the daily-loss risk counter whenever we cross into a new UTC
+    // calendar day. Historically `daily_pnl` was persisted forever, so a single
+    // bad day would permanently trip the RiskEngine's daily_loss_limit and
+    // block every subsequent entry until the counter crept back above the
+    // threshold via take-profits. Now we tag the counter with the UTC date it
+    // belongs to and reset it on day boundary (both at load-time and during
+    // the main loop).
+    let today_str = current_utc_date_str();
+    let saved_date = persisted.daily_pnl_date.trim();
+    let mut daily_pnl_date = if saved_date.is_empty() {
+        // Legacy state file without a date tag. Conservatively treat the
+        // stored pnl as "stale" and start today fresh.
+        if daily_pnl != Decimal::ZERO {
+            println!(
+                "plan_c: state file has no daily_pnl_date — treating cached daily_pnl={daily_pnl} as stale and resetting to 0 for {today_str}"
+            );
+            daily_pnl = Decimal::ZERO;
+        }
+        today_str.clone()
+    } else if saved_date == today_str {
+        saved_date.to_string()
+    } else {
+        println!(
+            "plan_c: daily_pnl roll-over at load — saved_date={saved_date} today={today_str}; resetting daily_pnl from {daily_pnl} to 0"
+        );
+        daily_pnl = Decimal::ZERO;
+        today_str.clone()
+    };
     {
         let active = open_positions
             .iter()
@@ -2579,13 +2644,14 @@ pub(crate) async fn run_plan_c_loop<C>(
             .count();
         let resolved = open_positions.len() - active;
         println!(
-            "plan_c: restored {} position(s) (active={} resolved_or_failed={}) + {} pending buy(s), {} trader watermark(s), daily_pnl={}",
+            "plan_c: restored {} position(s) (active={} resolved_or_failed={}) + {} pending buy(s), {} trader watermark(s), daily_pnl={} (date={})",
             open_positions.len(),
             active,
             resolved,
             pending_buys.len(),
             last_seen_trades.len(),
-            daily_pnl
+            daily_pnl,
+            daily_pnl_date
         );
     }
 
@@ -2649,6 +2715,7 @@ pub(crate) async fn run_plan_c_loop<C>(
         &pending_buys,
         &last_seen_trades,
         daily_pnl,
+        &daily_pnl_date,
     );
 
     let mut qualified_traders: Vec<QualifiedTrader> = Vec::new();
@@ -2660,6 +2727,30 @@ pub(crate) async fn run_plan_c_loop<C>(
     loop {
         loop_idx += 1;
         let now = Utc::now().timestamp();
+
+        // Roll over daily_pnl whenever the UTC date advances while the bot
+        // is running. Without this, a bot that stays up across midnight would
+        // keep yesterday's losses on the books and stay blocked by the
+        // RiskEngine's daily_loss_limit until the counter organically recovers.
+        {
+            let today_str = current_utc_date_str();
+            if today_str != daily_pnl_date {
+                println!(
+                    "plan_c: daily_pnl roll-over — previous_date={} today={} (resetting daily_pnl from {} to 0)",
+                    daily_pnl_date, today_str, daily_pnl
+                );
+                daily_pnl = Decimal::ZERO;
+                daily_pnl_date = today_str;
+                save_plan_c_state(
+                    state_path,
+                    &open_positions,
+                    &pending_buys,
+                    &last_seen_trades,
+                    daily_pnl,
+                    &daily_pnl_date,
+                );
+            }
+        }
 
         let mut force_refresh = false;
         if !last_top20_snapshot.is_empty() && !qualified_traders.is_empty() {
@@ -2800,6 +2891,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                 &pending_buys,
                 &last_seen_trades,
                 daily_pnl,
+                &daily_pnl_date,
             );
         }
 
@@ -2882,6 +2974,7 @@ pub(crate) async fn run_plan_c_loop<C>(
 
                     let sell_price =
                         (current_bid - buy_slippage).max(Decimal::new(1, 2)).round_dp(2);
+                    let sell_size = conservative_sell_size(pos.size);
                     let signal = poly2::StrategySignal {
                         strategy_id: StrategyId::ProbabilityTrading,
                         market_id: pos.market_id.clone(),
@@ -2890,7 +2983,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                         actions: vec![poly2::OrderIntent {
                             side: pos.side.clone(),
                             price: sell_price,
-                            size: pos.size,
+                            size: sell_size,
                             sell: true,
                             gtd_expiration: None,
                         }],
@@ -2899,7 +2992,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                     match execution.submit(&signal).await {
                         Ok(report) => {
                             print_execution_report(&report);
-                            let round_pnl = (current_bid - pos.entry_price) * pos.size;
+                            let round_pnl = (current_bid - pos.entry_price) * sell_size;
                             daily_pnl += round_pnl;
                             append_round_record(
                                 round_log_path,
@@ -2908,7 +3001,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                                 format!("copy_{}", pos.trader),
                                 pos.entry_price,
                                 current_bid,
-                                pos.size,
+                                sell_size,
                                 round_pnl,
                                 "leader_sell",
                             );
@@ -2917,17 +3010,29 @@ pub(crate) async fn run_plan_c_loop<C>(
                                 &pos.market_title,
                                 &pos.trader_name,
                                 &pos.side,
-                                pos.size,
+                                sell_size,
                                 pos.entry_price,
                                 pos.opened_at,
                                 current_bid,
                                 round_pnl,
                                 Utc::now().timestamp(),
                             );
+                            closed_indices.push(idx);
                         }
-                        Err(e) => eprintln!("plan_c: sell (leader exit) failed: {e}"),
+                        Err(e) => {
+                            // IMPORTANT: keep the position in local state so the next poll
+                            // retries the exit. Historical bug: we used to drop the position
+                            // here unconditionally, producing "ghost" positions that stayed
+                            // on-chain but were invisible to the bot.
+                            eprintln!(
+                                "plan_c: sell (leader exit) failed — keeping position for retry: {e}"
+                            );
+                        }
                     }
-                    closed_indices.push(idx);
+                    // Skip local SL/TP this round regardless of leader-exit outcome:
+                    //   - on success, the position was just closed;
+                    //   - on failure, we don't want to immediately fire a second sell order
+                    //     in the same poll; next round will re-detect and retry cleanly.
                     continue;
                 }
             }
@@ -2944,6 +3049,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                 );
 
                 let sell_price = (current_bid - buy_slippage).max(Decimal::new(1, 2)).round_dp(2);
+                let sell_size = conservative_sell_size(pos.size);
                 let signal = poly2::StrategySignal {
                     strategy_id: StrategyId::ProbabilityTrading,
                     market_id: pos.market_id.clone(),
@@ -2952,7 +3058,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                     actions: vec![poly2::OrderIntent {
                         side: pos.side.clone(),
                         price: sell_price,
-                        size: pos.size,
+                        size: sell_size,
                         sell: true,
                         gtd_expiration: None,
                     }],
@@ -2961,29 +3067,35 @@ pub(crate) async fn run_plan_c_loop<C>(
                 match execution.submit(&signal).await {
                     Ok(report) => {
                         print_execution_report(&report);
-                        let round_pnl = (current_bid - pos.entry_price) * pos.size;
+                        let round_pnl = (current_bid - pos.entry_price) * sell_size;
                         daily_pnl += round_pnl;
                         append_round_record(
                             round_log_path, loop_idx, &pos.market_id,
                             format!("copy_{}", pos.trader),
-                            pos.entry_price, current_bid, pos.size, round_pnl, "stop_loss",
+                            pos.entry_price, current_bid, sell_size, round_pnl, "stop_loss",
                         );
                         update_history_close(
                             history_path,
                             &pos.market_title,
                             &pos.trader_name,
                             &pos.side,
-                            pos.size,
+                            sell_size,
                             pos.entry_price,
                             pos.opened_at,
                             current_bid,
                             round_pnl,
                             Utc::now().timestamp(),
                         );
+                        closed_indices.push(idx);
                     }
-                    Err(e) => eprintln!("plan_c: sell (stop loss) failed: {e}"),
+                    Err(e) => {
+                        // Keep the position for a retry on the next poll instead
+                        // of dropping it and leaving a ghost on-chain.
+                        eprintln!(
+                            "plan_c: sell (stop loss) failed — keeping position for retry: {e}"
+                        );
+                    }
                 }
-                closed_indices.push(idx);
             } else if local_safety_active && pnl_pct >= take_profit_pct {
                 println!(
                     "plan_c: TAKE PROFIT — market={} bid={} entry={} pnl={:.2}%",
@@ -2992,6 +3104,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                 );
 
                 let sell_price = (current_bid - buy_slippage).max(Decimal::new(1, 2)).round_dp(2);
+                let sell_size = conservative_sell_size(pos.size);
                 let signal = poly2::StrategySignal {
                     strategy_id: StrategyId::ProbabilityTrading,
                     market_id: pos.market_id.clone(),
@@ -3000,7 +3113,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                     actions: vec![poly2::OrderIntent {
                         side: pos.side.clone(),
                         price: sell_price,
-                        size: pos.size,
+                        size: sell_size,
                         sell: true,
                         gtd_expiration: None,
                     }],
@@ -3009,29 +3122,35 @@ pub(crate) async fn run_plan_c_loop<C>(
                 match execution.submit(&signal).await {
                     Ok(report) => {
                         print_execution_report(&report);
-                        let round_pnl = (current_bid - pos.entry_price) * pos.size;
+                        let round_pnl = (current_bid - pos.entry_price) * sell_size;
                         daily_pnl += round_pnl;
                         append_round_record(
                             round_log_path, loop_idx, &pos.market_id,
                             format!("copy_{}", pos.trader),
-                            pos.entry_price, current_bid, pos.size, round_pnl, "take_profit",
+                            pos.entry_price, current_bid, sell_size, round_pnl, "take_profit",
                         );
                         update_history_close(
                             history_path,
                             &pos.market_title,
                             &pos.trader_name,
                             &pos.side,
-                            pos.size,
+                            sell_size,
                             pos.entry_price,
                             pos.opened_at,
                             current_bid,
                             round_pnl,
                             Utc::now().timestamp(),
                         );
+                        closed_indices.push(idx);
                     }
-                    Err(e) => eprintln!("plan_c: sell (take profit) failed: {e}"),
+                    Err(e) => {
+                        // Keep the position for a retry on the next poll instead
+                        // of dropping it and leaving a ghost on-chain.
+                        eprintln!(
+                            "plan_c: sell (take profit) failed — keeping position for retry: {e}"
+                        );
+                    }
                 }
-                closed_indices.push(idx);
             }
         }
         let any_closed = !closed_indices.is_empty();
@@ -3046,6 +3165,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                 &pending_buys,
                 &last_seen_trades,
                 daily_pnl,
+                &daily_pnl_date,
             );
         }
 
@@ -3205,6 +3325,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                     &pending_buys,
                     &last_seen_trades,
                     daily_pnl,
+                    &daily_pnl_date,
                 );
             }
         }
@@ -3652,6 +3773,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                                 &pending_buys,
                                 &last_seen_trades,
                                 daily_pnl,
+                                &daily_pnl_date,
                             );
 
                         // Case B: order accepted as a resting limit order (Pending) —
@@ -3688,6 +3810,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                                     &pending_buys,
                                     &last_seen_trades,
                                     daily_pnl,
+                                    &daily_pnl_date,
                                 );
                             } else {
                                 eprintln!(
@@ -3727,6 +3850,7 @@ pub(crate) async fn run_plan_c_loop<C>(
             &pending_buys,
             &last_seen_trades,
             daily_pnl,
+            &daily_pnl_date,
         );
 
         let active_cnt = open_positions
