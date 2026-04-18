@@ -324,10 +324,16 @@ impl ExecutionClient for PolymarketSdkExecutionClient {
             let token_id = PmU256::from_str(token_id_raw.trim()).map_err(|e| {
                 ExecutionError::Backend(format!("invalid token_id '{}' for market {}: {e}", token_id_raw, signal.market_id))
             })?;
-            let price = PmDecimal::from_str(&action.price.to_string())
-                .map_err(|e| ExecutionError::Backend(format!("invalid order price {}: {e}", action.price)))?;
-            let size = PmDecimal::from_str(&action.size.to_string())
-                .map_err(|e| ExecutionError::Backend(format!("invalid order size {}: {e}", action.size)))?;
+            // Polymarket rejects orders with > 2 decimal places on both price and size
+            // ("Maximum lot size is 2"). Normalize + round here as a defensive net so
+            // strategies can't silently ship, e.g., 11.11000000 (produced when a Decimal
+            // retains scale=8 from an earlier f64→string conversion).
+            let normalized_price = action.price.round_dp(2).normalize();
+            let normalized_size = action.size.round_dp(2).normalize();
+            let price = PmDecimal::from_str(&normalized_price.to_string())
+                .map_err(|e| ExecutionError::Backend(format!("invalid order price {}: {e}", normalized_price)))?;
+            let size = PmDecimal::from_str(&normalized_size.to_string())
+                .map_err(|e| ExecutionError::Backend(format!("invalid order size {}: {e}", normalized_size)))?;
             let side = if action.sell { PmSide::Sell } else { PmSide::Buy };
 
             let mut builder = self

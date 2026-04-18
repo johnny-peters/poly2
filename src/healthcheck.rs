@@ -45,6 +45,16 @@ impl HealthcheckReport {
 #[derive(Debug, Deserialize)]
 struct JsonRpcResp {
     result: Option<String>,
+    #[serde(default)]
+    error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcError {
+    #[serde(default)]
+    code: Option<i64>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -716,39 +726,135 @@ async fn check_latest_block(rpc_url: &str) -> Result<String> {
     Ok(format!("latest_block={block_hex}"))
 }
 
-/// Query ERC20 `balanceOf(wallet)` via `eth_call` and return the human-readable decimal value
-/// (raw uint256 divided by 10^`decimals`).
-pub async fn fetch_erc20_balance(
+/// One attempt of an `eth_call` against a single RPC URL.
+async fn eth_call_once(
+    client: &reqwest::Client,
     rpc_url: &str,
     contract: &str,
-    wallet: &str,
-    decimals: u32,
-) -> Result<Decimal> {
-    let wallet_clean = wallet.trim().trim_start_matches("0x");
-    let data = format!("0x70a08231{:0>64}", wallet_clean);
+    data: &str,
+) -> Result<String> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "eth_call",
         "params": [{"to": contract, "data": data}, "latest"],
         "id": 42
     });
-    let resp = reqwest::Client::new()
+    let resp = client
         .post(rpc_url)
         .json(&body)
         .send()
         .await
-        .context("erc20 balanceOf rpc request failed")?
-        .json::<JsonRpcResp>()
+        .with_context(|| format!("rpc request to {rpc_url} failed"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
         .await
-        .context("erc20 balanceOf rpc parse failed")?;
-    let hex = resp
-        .result
-        .ok_or_else(|| anyhow!("erc20 balanceOf: missing result"))?;
-    let hex_clean = hex.trim().trim_start_matches("0x");
-    let raw = u128::from_str_radix(hex_clean, 16)
-        .with_context(|| format!("erc20 balanceOf: invalid hex '{hex_clean}'"))?;
-    let divisor = Decimal::from(10u64.pow(decimals));
-    Ok(Decimal::from(raw) / divisor)
+        .with_context(|| format!("rpc body read from {rpc_url} failed"))?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "rpc {rpc_url} http {status}: {}",
+            text.chars().take(200).collect::<String>()
+        ));
+    }
+    let parsed: JsonRpcResp = serde_json::from_str(&text).with_context(|| {
+        format!(
+            "rpc {rpc_url} parse failed, body={}",
+            text.chars().take(200).collect::<String>()
+        )
+    })?;
+    if let Some(err) = parsed.error {
+        return Err(anyhow!(
+            "rpc {rpc_url} jsonrpc error code={:?} msg={:?}",
+            err.code,
+            err.message
+        ));
+    }
+    parsed.result.ok_or_else(|| {
+        anyhow!(
+            "rpc {rpc_url}: missing result (body={})",
+            text.chars().take(200).collect::<String>()
+        )
+    })
+}
+
+/// Query ERC20 `balanceOf(wallet)` via `eth_call` and return the human-readable decimal value
+/// (raw uint256 divided by 10^`decimals`).
+///
+/// `rpc_urls` is tried in order, with per-URL retries and exponential backoff. Returns the
+/// first successful result; if all URLs fail, returns the last error seen.
+pub async fn fetch_erc20_balance_multi(
+    rpc_urls: &[&str],
+    contract: &str,
+    wallet: &str,
+    decimals: u32,
+) -> Result<Decimal> {
+    if rpc_urls.is_empty() {
+        return Err(anyhow!("no rpc url configured"));
+    }
+    let wallet_clean = wallet.trim().trim_start_matches("0x");
+    let data = format!("0x70a08231{:0>64}", wallet_clean);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("http client build failed")?;
+
+    // Collect the FINAL error from each URL (after per-URL retries exhausted) so the
+    // caller can show the operator every failure mode at once — hiding all but the
+    // last one makes it hard to tell e.g. "rpc A 429, rpc B auth, rpc C timeout".
+    let mut per_url_errors: Vec<String> = Vec::new();
+    const MAX_ATTEMPTS_PER_URL: u32 = 3;
+    for url in rpc_urls {
+        let mut last_err_for_url: Option<anyhow::Error> = None;
+        for attempt in 1..=MAX_ATTEMPTS_PER_URL {
+            match eth_call_once(&client, url, contract, &data).await {
+                Ok(hex) => {
+                    let hex_clean = hex.trim().trim_start_matches("0x");
+                    let hex_clean = if hex_clean.is_empty() { "0" } else { hex_clean };
+                    let raw = u128::from_str_radix(hex_clean, 16).with_context(|| {
+                        format!("erc20 balanceOf: invalid hex '{hex_clean}'")
+                    })?;
+                    let divisor = Decimal::from(10u64.pow(decimals));
+                    return Ok(Decimal::from(raw) / divisor);
+                }
+                Err(e) => {
+                    let is_last = attempt == MAX_ATTEMPTS_PER_URL;
+                    if !is_last {
+                        // Exponential backoff: 300ms, 900ms.
+                        let backoff_ms = 300u64 * 3u64.pow(attempt - 1);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                    last_err_for_url = Some(e);
+                }
+            }
+        }
+        if let Some(e) = last_err_for_url {
+            per_url_errors.push(format!("[{url}] {e}"));
+        }
+    }
+    Err(anyhow!(
+        "erc20 balanceOf failed on all {} rpc(s):\n  - {}",
+        per_url_errors.len(),
+        per_url_errors.join("\n  - ")
+    ))
+}
+
+/// Single-URL variant retained for backward compatibility and healthcheck callers.
+pub async fn fetch_erc20_balance(
+    rpc_url: &str,
+    contract: &str,
+    wallet: &str,
+    decimals: u32,
+) -> Result<Decimal> {
+    fetch_erc20_balance_multi(&[rpc_url], contract, wallet, decimals).await
+}
+
+/// Convenience wrapper: query USDC (6-decimal) balance for a wallet, with multi-RPC fallback.
+pub async fn fetch_usdc_balance_multi(
+    rpc_urls: &[&str],
+    usdc_contract: &str,
+    wallet: &str,
+) -> Result<Decimal> {
+    fetch_erc20_balance_multi(rpc_urls, usdc_contract, wallet, 6).await
 }
 
 /// Convenience wrapper: query USDC (6-decimal) balance for a wallet.

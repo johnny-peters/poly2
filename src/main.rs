@@ -31,6 +31,7 @@ use poly2::{
 mod plan_a;
 mod plan_b;
 mod plan_c;
+mod plan_c_redeem;
 
 pub(crate) async fn fetch_clob_price(token_id: &str, side: &str) -> anyhow::Result<Decimal> {
     let url = format!(
@@ -271,6 +272,17 @@ pub(crate) fn read_f64_env_or(dotenv_path: &Path, key: &str, default_value: f64)
     resolve_runtime_var(key, dotenv_path)
         .and_then(|v| v.trim().parse::<f64>().ok())
         .unwrap_or(default_value)
+}
+
+pub(crate) fn read_bool_env_or(dotenv_path: &Path, key: &str, default_value: bool) -> bool {
+    match resolve_runtime_var(key, dotenv_path) {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "y" | "on" => true,
+            "0" | "false" | "no" | "n" | "off" => false,
+            _ => default_value,
+        },
+        None => default_value,
+    }
 }
 
 // Plan A/B/C implementations are in plan_a.rs, plan_b.rs, plan_c.rs respectively.
