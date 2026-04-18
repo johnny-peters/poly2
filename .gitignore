@@ -1,6 +1,7 @@
 # Rust build output
 /target/
 /target_tmp/
+/target_test_run/
 /.tools/
 
 # Environment and secrets (NEVER commit these!)

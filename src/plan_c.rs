@@ -1,9 +1,12 @@
 use anyhow::{anyhow, Context};
 use chrono::Utc;
+use futures::future::join_all;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::time::{self, Duration};
 
 use poly2::{ExecutionClient, ExecutionStatus, RiskEngine, Side, StrategyContext, StrategyId};
@@ -104,22 +107,42 @@ struct QualifiedTrader {
     volume: f64,
     avg_interval_secs: f64,
     trade_count: usize,
+    /// Return on turnover for leaderboard period: `pnl / volume` (diagnostic).
     roi: f64,
+    /// Sharpe-like score from last-7d daily realized PnL (see `analyze_trader_full`).
+    sharpe_7d: f64,
+    /// Net realized / buy notional in last `recent_window_hours`.
+    ret_7d: f64,
     win_rate: f64,
     profit_factor: f64,
     recent_roi: f64,
+    max_drawdown: f64,
     score: f64,
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct TraderAnalysis {
     avg_interval_secs: f64,
     trade_count: usize,
     interval_stddev: f64,
     active_hour_ratio: f64,
-    win_rate: f64,
+    /// Raw WR from FIFO closes (wins / total); kept for logging only.
+    win_rate_raw: f64,
+    /// Wilson 95% lower bound on WR.
+    wilson_wr_lcb: f64,
+    /// Bayesian-shrunk profit factor.
     profit_factor: f64,
+    /// Fixed-formula recent ROI: net 7d / buy notional 7d.
     recent_roi: f64,
+    sharpe_7d: f64,
+    ret_7d: f64,
+    max_drawdown: f64,
+    /// Net realized PnL from all FIFO-closed trades in history (gp - gl).
+    net_realized_pnl: f64,
+    notional_cv: f64,
+    market_diversity: f64,
+    size_p99_p50: f64,
     /// Number of FIFO-closed trades over the full trade history.
     /// `0` means we could not pair any BUY→SELL, so win_rate / profit_factor
     /// are meaningless zeros, not real statistics.
@@ -757,6 +780,9 @@ struct OnchainPosition {
     redeemable: Option<bool>,
     #[serde(default, alias = "curPrice")]
     cur_price: Option<f64>,
+    /// Realized PnL when present (Polymarket data-api).
+    #[serde(default, alias = "cashPnl")]
+    cash_pnl: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1325,6 +1351,17 @@ fn short_token(token_id: &str) -> String {
     format!("{}…", &token_id[..end])
 }
 
+/// Jaccard-like overlap of two top-N address lists (both treated as sets, denom = 20).
+fn leaderboard_top_overlap(prev: &[String], new: &[String]) -> f64 {
+    if prev.is_empty() && new.is_empty() {
+        return 1.0;
+    }
+    let a: std::collections::HashSet<&str> = prev.iter().map(|s| s.as_str()).collect();
+    let b: std::collections::HashSet<&str> = new.iter().map(|s| s.as_str()).collect();
+    let inter = a.intersection(&b).count();
+    inter as f64 / 20.0
+}
+
 fn normalize_leaderboard_period(raw: &str) -> &'static str {
     match raw.trim().to_ascii_uppercase().as_str() {
         "DAY" | "DAILY" | "D" => "DAY",
@@ -1339,6 +1376,7 @@ async fn fetch_leaderboard(
     http: &reqwest::Client,
     limit: u64,
     period: &str,
+    order_by: &str,
 ) -> anyhow::Result<Vec<LeaderboardEntry>> {
     let api_period = normalize_leaderboard_period(period);
     let clamped_limit = limit.min(50);
@@ -1346,13 +1384,14 @@ async fn fetch_leaderboard(
     let mut offset: u64 = 0;
 
     while all_entries.len() < limit as usize {
-        let batch = clamped_limit.min(limit.saturating_sub(offset));
-        if batch == 0 {
+        let remaining = limit.saturating_sub(all_entries.len() as u64);
+        let batch = clamped_limit.min(remaining).max(1);
+        if remaining == 0 {
             break;
         }
         let url = format!(
-            "https://data-api.polymarket.com/v1/leaderboard?limit={}&offset={}&timePeriod={}&orderBy=PNL",
-            batch, offset, api_period
+            "https://data-api.polymarket.com/v1/leaderboard?limit={}&offset={}&timePeriod={}&orderBy={}",
+            batch, offset, api_period, order_by
         );
         let resp = http
             .get(&url)
@@ -1379,6 +1418,54 @@ async fn fetch_leaderboard(
     }
 
     Ok(all_entries)
+}
+
+/// Build pool: (WEEK PNL ∩ MONTH PNL) ∪ WEEK VOL, dedup, cap `max_candidates`.
+///
+/// Note on `orderBy`: Polymarket data-api only accepts `PNL` or `VOL`
+/// (case-insensitive) — anything else (incl. the literal `VOLUME`) returns
+/// HTTP 400, which as of 2026-04 would silently collapse the entire pool
+/// through the caller's `unwrap_or_default()`.
+async fn fetch_leaderboard_candidate_pool(
+    http: &reqwest::Client,
+    per_list_limit: u64,
+    max_candidates: usize,
+) -> anyhow::Result<Vec<LeaderboardEntry>> {
+    let wp = fetch_leaderboard(http, per_list_limit, "WEEK", "PNL").await?;
+    let mp = fetch_leaderboard(http, per_list_limit, "MONTH", "PNL").await?;
+    let wv = fetch_leaderboard(http, per_list_limit, "WEEK", "VOL").await?;
+
+    let mut month_addrs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in &mp {
+        if let Some(a) = &e.proxy_wallet {
+            if !a.trim().is_empty() {
+                month_addrs.insert(a.trim().to_lowercase());
+            }
+        }
+    }
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pool: Vec<LeaderboardEntry> = Vec::new();
+
+    for e in wp {
+        if let Some(a) = &e.proxy_wallet {
+            let al = a.trim().to_lowercase();
+            if month_addrs.contains(&al) && seen.insert(al.clone()) {
+                pool.push(e);
+            }
+        }
+    }
+    for e in wv {
+        if let Some(a) = &e.proxy_wallet {
+            let al = a.trim().to_lowercase();
+            if seen.insert(al) {
+                pool.push(e);
+            }
+        }
+    }
+
+    pool.truncate(max_candidates);
+    Ok(pool)
 }
 
 async fn fetch_user_trades(
@@ -1422,56 +1509,124 @@ fn stddev(values: &[f64]) -> f64 {
     var.sqrt()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compute_score(
-    roi: f64,
-    win_rate: f64,
-    profit_factor: f64,
-    recent_roi: f64,
-    w_roi: f64,
-    w_wr: f64,
-    w_pf: f64,
-    w_rr: f64,
-) -> f64 {
-    let roi_norm = roi.clamp(0.0, 5.0) / 5.0;
-    let wr_norm = win_rate.clamp(0.0, 1.0);
-    let pf_norm = profit_factor.clamp(0.0, 5.0) / 5.0;
-    // recent_roi reasonable range ~ [-1, +1]; remap to [0, 1] with clipping.
-    let rr_norm = (recent_roi + 1.0).clamp(0.0, 2.0) / 2.0;
-
-    (w_roi * roi_norm) + (w_wr * wr_norm) + (w_pf * pf_norm) + (w_rr * rr_norm)
+fn wilson_lower_bound(wins: usize, n: usize, z: f64) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    let phat = wins as f64 / n as f64;
+    let z2 = z * z;
+    let nf = n as f64;
+    let denom = 1.0 + z2 / nf;
+    let center = phat + z2 / (2.0 * nf);
+    let inner = phat * (1.0 - phat) / nf + z2 / (4.0 * nf * nf);
+    let margin = z * inner.sqrt();
+    ((center - margin) / denom).clamp(0.0, 1.0)
 }
 
-/// Walk all trades in chronological order, grouping by (condition_id, asset),
-/// and match BUY/SELL lots FIFO. Each SELL event produces one "closed trade"
-/// and a P&L (using per-share price). Returns (wins, total, gross_profit, gross_loss).
-fn fifo_pnl_stats(trades: &[TradeRecord], since_ts: Option<i64>) -> (usize, usize, f64, f64) {
-    #[derive(Default)]
+fn profit_factor_shrinkage(gp: f64, gl: f64, alpha: f64, beta: f64) -> f64 {
+    (gp + alpha) / (gl + beta).max(1e-9)
+}
+
+fn max_drawdown_from_equity_events(events: &[(i64, f64)]) -> f64 {
+    if events.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = events.to_vec();
+    sorted.sort_by_key(|(ts, _)| *ts);
+    let mut cum = 0.0f64;
+    let mut peak = 0.0f64;
+    let mut max_dd = 0.0f64;
+    for (_, pnl) in &sorted {
+        cum += pnl;
+        if cum > peak {
+            peak = cum;
+        }
+        let dd = peak - cum;
+        if dd > max_dd {
+            max_dd = dd;
+        }
+    }
+    max_dd
+}
+
+/// Aggregate FIFO-closed PnL per `(condition_id, outcome token)`.
+/// `count_cutoff`: only closes with `timestamp >= cutoff` contribute to win/factor stats;
+/// equity curve for DD always uses *all* closes (pass full agg with `count_cutoff == None` for DD).
+#[derive(Debug, Default, Clone)]
+struct FifoPnlAgg {
+    wins: usize,
+    total: usize,
+    gross_profit: f64,
+    gross_loss: f64,
+    max_drawdown: f64,
+    net_realized: f64,
+    pnl_by_condition: HashMap<String, f64>,
+    equity_events: Vec<(i64, f64)>,
+}
+
+/// FIFO P&L aggregate, **collapsing neg-risk YES/NO pairs** within each
+/// `condition_id` to a single "YES"-unit ledger.
+///
+/// Why: in Polymarket neg-risk markets some leaders routinely hedge by holding
+/// YES and NO of the same event at the same time; the old per-asset grouping
+/// counted each side as a separate ledger, which double-counts wins/losses and
+/// distorts PF/WR. The canonical YES is the asset with the most trades inside
+/// the condition; non-canonical trades are translated:
+/// * BUY  NO @ p  ≡ SELL YES @ (1-p)
+/// * SELL NO @ p  ≡ BUY  YES @ (1-p)
+///
+/// After collapsing, a perfectly hedged leader produces `total=0` closes — their
+/// WR/PF/Score correctly degrade to "no useful signal".
+fn fifo_pnl_aggregate(trades: &[TradeRecord], count_cutoff: Option<i64>) -> FifoPnlAgg {
+    #[derive(Default, Clone)]
     struct Lot {
         size: f64,
         price: f64,
     }
 
-    let mut grouped: HashMap<(String, String), Vec<&TradeRecord>> = HashMap::new();
+    let cutoff_ts = count_cutoff.unwrap_or(i64::MIN);
+
+    // Step 1: group by condition_id only.
+    let mut by_cond: HashMap<String, Vec<&TradeRecord>> = HashMap::new();
     for t in trades {
         let cid = match &t.condition_id {
             Some(v) if !v.trim().is_empty() => v.trim().to_string(),
             _ => continue,
         };
-        let asset = match &t.asset {
-            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
-            _ => continue,
-        };
-        grouped.entry((cid, asset)).or_default().push(t);
+        if t.asset.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            continue;
+        }
+        by_cond.entry(cid).or_default().push(t);
     }
 
     let mut wins = 0usize;
     let mut total = 0usize;
     let mut gross_profit = 0.0f64;
     let mut gross_loss = 0.0f64;
+    let mut pnl_by_condition: HashMap<String, f64> = HashMap::new();
+    let mut equity_events: Vec<(i64, f64)> = Vec::new();
 
-    for (_, mut items) in grouped {
+    for (cid, mut items) in by_cond {
         items.sort_by_key(|t| t.timestamp.unwrap_or(0));
+
+        // Step 2: pick canonical YES asset = most-traded asset in this condition.
+        // Deterministic tiebreak: lexicographic smaller asset id.
+        let mut asset_counts: HashMap<String, usize> = HashMap::new();
+        for t in &items {
+            if let Some(a) = t.asset.as_deref() {
+                let key = a.trim().to_string();
+                if !key.is_empty() {
+                    *asset_counts.entry(key).or_insert(0) += 1;
+                }
+            }
+        }
+        // Canonical YES = most-traded asset; tiebreak by lexicographically smaller id.
+        let yes_asset: String = asset_counts
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+            .map(|(k, _)| k)
+            .unwrap_or_default();
+
         let mut inventory: Vec<Lot> = Vec::new();
         for t in items {
             let side = t.side.as_deref().unwrap_or("");
@@ -1480,16 +1635,31 @@ fn fifo_pnl_stats(trades: &[TradeRecord], since_ts: Option<i64>) -> (usize, usiz
             if size <= 0.0 {
                 continue;
             }
-            if side.eq_ignore_ascii_case("BUY") {
-                inventory.push(Lot { size, price });
-            } else if side.eq_ignore_ascii_case("SELL") {
+            let asset = t.asset.as_deref().unwrap_or("").trim();
+            let is_yes = !yes_asset.is_empty() && asset == yes_asset;
+
+            // Translate BUY/SELL NO to the canonical YES side.
+            let (canon_buy, canon_price) = match (is_yes, side.to_ascii_uppercase().as_str()) {
+                (true, "BUY") => (true, price),
+                (true, "SELL") => (false, price),
+                (false, "BUY") => (false, 1.0 - price),
+                (false, "SELL") => (true, 1.0 - price),
+                _ => continue,
+            };
+
+            if canon_buy {
+                inventory.push(Lot {
+                    size,
+                    price: canon_price,
+                });
+            } else {
                 let mut remaining = size;
                 let mut pnl = 0.0f64;
                 let mut matched = false;
                 while remaining > 0.0 && !inventory.is_empty() {
                     let lot = inventory.first_mut().expect("inventory not empty");
                     let take = remaining.min(lot.size);
-                    pnl += (price - lot.price) * take;
+                    pnl += (canon_price - lot.price) * take;
                     lot.size -= take;
                     remaining -= take;
                     matched = true;
@@ -1500,26 +1670,133 @@ fn fifo_pnl_stats(trades: &[TradeRecord], since_ts: Option<i64>) -> (usize, usiz
                 if !matched {
                     continue;
                 }
-                // Only count trades closed after since_ts (None = all time).
-                if let Some(cutoff) = since_ts {
-                    if t.timestamp.unwrap_or(0) < cutoff {
-                        continue;
-                    }
+                let ts = t.timestamp.unwrap_or(0);
+                equity_events.push((ts, pnl));
+                if ts < cutoff_ts {
+                    continue;
                 }
                 total += 1;
-                if pnl > 0.0 {
+                // Avoid classifying sub-cent float noise (e.g. from a perfectly
+                // hedged YES/NO leg) as a "win" — 1e-6 USD is below settlement
+                // precision on any real trade.
+                if pnl > 1e-6 {
                     wins += 1;
                     gross_profit += pnl;
-                } else if pnl < 0.0 {
+                } else if pnl < -1e-6 {
                     gross_loss += -pnl;
                 }
+                *pnl_by_condition.entry(cid.clone()).or_insert(0.0) += pnl;
             }
         }
     }
 
-    (wins, total, gross_profit, gross_loss)
+    let net_realized = gross_profit - gross_loss;
+    let max_drawdown = if count_cutoff.is_none() {
+        max_drawdown_from_equity_events(&equity_events)
+    } else {
+        0.0
+    };
+
+    FifoPnlAgg {
+        wins,
+        total,
+        gross_profit,
+        gross_loss,
+        max_drawdown,
+        net_realized,
+        pnl_by_condition,
+        equity_events,
+    }
 }
 
+fn buy_notional_since(trades: &[TradeRecord], since_ts: i64, now_ts: i64) -> f64 {
+    trades
+        .iter()
+        .filter_map(|t| {
+            if !t.side.as_deref().unwrap_or("").eq_ignore_ascii_case("BUY") {
+                return None;
+            }
+            let ts = t.timestamp?;
+            if ts < since_ts || ts > now_ts {
+                return None;
+            }
+            let sz = t.size.unwrap_or(0.0).abs();
+            let px = t.price.unwrap_or(0.0);
+            Some(sz * px)
+        })
+        .sum()
+}
+
+fn retention_norm(x: f64, lo: f64, hi: f64) -> f64 {
+    if (hi - lo).abs() < 1e-12 {
+        return 0.0;
+    }
+    ((x - lo) / (hi - lo)).clamp(0.0, 1.0)
+}
+
+fn sharpe_daily_from_events(equity: &[(i64, f64)], window_start: i64, now_ts: i64) -> f64 {
+    let mut daily: HashMap<i64, f64> = HashMap::new();
+    for (ts, pnl) in equity {
+        if *ts < window_start || *ts > now_ts {
+            continue;
+        }
+        let day = *ts / 86_400;
+        *daily.entry(day).or_insert(0.0) += pnl;
+    }
+    let vals: Vec<f64> = daily.into_values().collect();
+    if vals.len() < 2 {
+        return 0.0;
+    }
+    let m = vals.iter().sum::<f64>() / vals.len() as f64;
+    let sd = stddev(&vals);
+    if sd < 1e-9 {
+        return 0.0;
+    }
+    m / sd
+}
+
+fn percentile_ratio(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 1.0;
+    }
+    let idx = (((sorted.len() as f64 - 1.0) * p).round() as usize).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+/// Wilson LCB, shrunk PF, `ret_norm` from Sharpe~7d, recent ROI norm, drawdown penalty.
+#[allow(clippy::too_many_arguments)]
+fn compute_score_v2(
+    sharpe_7d: f64,
+    wilson_wr: f64,
+    profit_factor_shrunk: f64,
+    recent_roi: f64,
+    dd_penalty: f64,
+    w_ret: f64,
+    w_wr: f64,
+    w_pf: f64,
+    w_rr: f64,
+    w_dd: f64,
+) -> f64 {
+    let ret_norm = retention_norm(sharpe_7d.clamp(-3.0, 6.0), -3.0, 6.0);
+    let pf_norm = profit_factor_shrunk.clamp(0.0, 8.0) / 8.0;
+    let rr_norm = retention_norm(recent_roi.clamp(-0.75, 1.5), -0.75, 1.5);
+    w_ret * ret_norm
+        + w_wr * wilson_wr.clamp(0.0, 1.0)
+        + w_pf * pf_norm
+        + w_rr * rr_norm
+        - w_dd * dd_penalty.clamp(0.0, 1.0)
+}
+
+fn max_single_market_concentration(agg: &FifoPnlAgg) -> f64 {
+    let den = agg.net_realized.abs().max(1.0);
+    agg.pnl_by_condition
+        .values()
+        .map(|v| v.abs())
+        .fold(0.0f64, f64::max)
+        / den
+}
+
+#[allow(clippy::too_many_arguments)]
 fn analyze_trader_full(
     trades: &[TradeRecord],
     analysis_hours: u64,
@@ -1528,9 +1805,27 @@ fn analyze_trader_full(
     min_interval_stddev: f64,
     max_active_hour_ratio: f64,
     recent_window_hours: u64,
+    max_notional_cv: f64,
+    min_market_diversity: f64,
+    max_size_p99_p50: f64,
+    pf_alpha: f64,
+    pf_beta: f64,
 ) -> TraderAnalysis {
     let now = Utc::now().timestamp();
     let cutoff = now - (analysis_hours as i64 * 3600);
+    let recent_cutoff = now - (recent_window_hours as i64 * 3600);
+    let sharpe_window_start = now - (7_i64 * 3600 * 24);
+
+    let full = fifo_pnl_aggregate(trades, None);
+    let recent_cut = fifo_pnl_aggregate(trades, Some(recent_cutoff));
+    let net_recent = recent_cut.gross_profit - recent_cut.gross_loss;
+    let buy_nom = buy_notional_since(trades, recent_cutoff, now).max(1.0);
+    let recent_roi = net_recent / buy_nom;
+
+    let wilson_wr_lcb = wilson_lower_bound(full.wins, full.total, 1.96);
+    let pf_raw = profit_factor_shrinkage(full.gross_profit, full.gross_loss, pf_alpha, pf_beta);
+
+    let sharpe_7d = sharpe_daily_from_events(&full.equity_events, sharpe_window_start, now);
 
     let mut recent_ts: Vec<i64> = trades
         .iter()
@@ -1540,31 +1835,35 @@ fn analyze_trader_full(
     recent_ts.sort();
 
     let trade_count = recent_ts.len();
-    // Closed-trade stats are computed from the FULL history even when the
-    // recent window is empty — a trader who hasn't traded in 24h can still be
-    // useful if we have enough historical pairs. Missing pairs (total == 0)
-    // propagates as closed_trade_count = 0 so the caller can apply a
-    // "insufficient stats" gate.
-    let (hist_wins, hist_total, hist_gp, hist_gl) = fifo_pnl_stats(trades, None);
+
+    let empty_behavioral = TraderAnalysis {
+        avg_interval_secs: f64::MAX,
+        trade_count: 0,
+        interval_stddev: 0.0,
+        active_hour_ratio: 0.0,
+        win_rate_raw: if full.total > 0 {
+            full.wins as f64 / full.total as f64
+        } else {
+            0.0
+        },
+        wilson_wr_lcb,
+        profit_factor: pf_raw,
+        recent_roi,
+        sharpe_7d,
+        ret_7d: recent_roi,
+        max_drawdown: full.max_drawdown,
+        net_realized_pnl: full.net_realized,
+        notional_cv: 1.0,
+        market_diversity: 0.0,
+        size_p99_p50: 1.0,
+        closed_trade_count: full.total,
+        is_bot: false,
+    };
+
     if trade_count == 0 {
-        return TraderAnalysis {
-            avg_interval_secs: f64::MAX,
-            trade_count: 0,
-            interval_stddev: 0.0,
-            active_hour_ratio: 0.0,
-            win_rate: if hist_total > 0 {
-                hist_wins as f64 / hist_total as f64
-            } else {
-                0.0
-            },
-            profit_factor: 0.0,
-            recent_roi: 0.0,
-            closed_trade_count: hist_total,
-            is_bot: false,
-        };
+        return empty_behavioral;
     }
 
-    // --- frequency stats ---
     let (avg_interval_secs, interval_stddev) = if recent_ts.len() < 2 {
         (f64::MAX, 0.0)
     } else {
@@ -1583,265 +1882,369 @@ fn analyze_trader_full(
     let denom_hours = (analysis_hours.min(24)).max(1) as f64;
     let active_hour_ratio = (active_hours.len() as f64) / denom_hours;
 
-    // --- FIFO-based win rate / profit factor over all available trades ---
-    let (wins, total, gross_profit, gross_loss) = (hist_wins, hist_total, hist_gp, hist_gl);
-    let win_rate = if total > 0 {
-        wins as f64 / total as f64
+    // Buy notionals & sizes in analysis window
+    let mut notionals: Vec<f64> = Vec::new();
+    let mut sizes: Vec<f64> = Vec::new();
+    let mut uniq_cid: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for t in trades {
+        let ts = match t.timestamp {
+            Some(x) if x >= cutoff => x,
+            _ => continue,
+        };
+        let _ = ts;
+        if let Some(cid) = t.condition_id.as_deref() {
+            if !cid.trim().is_empty() {
+                uniq_cid.insert(cid.trim().to_string());
+            }
+        }
+        if t.side.as_deref().unwrap_or("").eq_ignore_ascii_case("BUY") {
+            let sz = t.size.unwrap_or(0.0).abs();
+            let px = t.price.unwrap_or(0.0);
+            notionals.push(sz * px);
+            sizes.push(sz);
+        }
+    }
+    let mean_n = notionals.iter().sum::<f64>() / notionals.len().max(1) as f64;
+    let notional_cv = if mean_n > 1e-9 && notionals.len() > 1 {
+        stddev(&notionals) / mean_n
+    } else {
+        1.0
+    };
+    let market_diversity = if trade_count > 0 {
+        uniq_cid.len() as f64 / trade_count as f64
     } else {
         0.0
     };
-    let profit_factor = if gross_loss > 0.0 {
-        gross_profit / gross_loss
-    } else if gross_profit > 0.0 {
-        10.0
+    let mut sorted_sz = sizes;
+    sorted_sz.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p50 = percentile_ratio(&sorted_sz, 0.5);
+    let p99 = percentile_ratio(&sorted_sz, 0.99);
+    let size_p99_p50 = if p50 > 1e-9 { p99 / p50 } else { 1.0 };
+
+    let win_rate_raw = if full.total > 0 {
+        full.wins as f64 / full.total as f64
     } else {
         0.0
     };
 
-    // --- Recent ROI over a longer window (default 7 days) ---
-    // Closed trades within [now - recent_window_hours, now] are counted.
-    // Buys that have not yet been closed are conservatively ignored.
-    let recent_cutoff = now - (recent_window_hours as i64 * 3600);
-    let (_, _, recent_profit, recent_loss) = fifo_pnl_stats(trades, Some(recent_cutoff));
-    let net_recent_pnl = recent_profit - recent_loss;
-    let recent_gross_cost = recent_profit.max(0.0) + recent_loss.max(0.0);
-    let recent_roi = if recent_gross_cost > 0.0 {
-        net_recent_pnl / recent_gross_cost
-    } else {
-        0.0
-    };
-
+    // Bot filter v2 — avoid rejecting MM on interval alone.
     let is_bot = (trade_count > max_trades_in_window)
-        || (avg_interval_secs < min_avg_interval_secs)
+        || (avg_interval_secs < 60.0 && notional_cv < max_notional_cv && trade_count > 10)
+        || (trade_count > 30 && avg_interval_secs < min_avg_interval_secs)
         || ((interval_stddev < min_interval_stddev) && (trade_count > 20))
-        || ((active_hour_ratio > max_active_hour_ratio) && (trade_count > 50));
+        || ((active_hour_ratio > max_active_hour_ratio) && (trade_count > 50))
+        || (trade_count > 25 && market_diversity < min_market_diversity)
+        || (size_p99_p50 > max_size_p99_p50);
 
     TraderAnalysis {
         avg_interval_secs,
         trade_count,
         interval_stddev,
         active_hour_ratio,
-        win_rate,
-        profit_factor,
+        win_rate_raw,
+        wilson_wr_lcb,
+        profit_factor: pf_raw,
         recent_roi,
-        closed_trade_count: total,
+        sharpe_7d,
+        ret_7d: recent_roi,
+        max_drawdown: full.max_drawdown,
+        net_realized_pnl: full.net_realized,
+        notional_cv,
+        market_diversity,
+        size_p99_p50,
+        closed_trade_count: full.total,
         is_bot,
     }
 }
 
+async fn fetch_positions_unrealized_share(
+    http: &reqwest::Client,
+    wallet: &str,
+) -> anyhow::Result<Option<f64>> {
+    let positions = fetch_onchain_positions_once(http, wallet).await?;
+    let mut numer = 0.0f64;
+    let mut denom = 0.0f64;
+    for p in &positions {
+        let s = p.size.unwrap_or(0.0).abs();
+        let avg = p.avg_price.unwrap_or(0.0);
+        let cur = p.cur_price.unwrap_or(avg);
+        let cash = p.cash_pnl.unwrap_or(0.0);
+        let m2m = s * (cur - avg);
+        numer += m2m.abs();
+        denom += cash.abs() + m2m.abs();
+    }
+    if denom < 1e-3 {
+        return Ok(None);
+    }
+    Ok(Some(numer / denom))
+}
+
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::cognitive_complexity)]
 async fn discover_qualified_traders(
     http: &reqwest::Client,
+    use_multi_leaderboard: bool,
+    per_list_limit: u64,
+    candidate_pool_max: usize,
     leaderboard_limit: u64,
     period: &str,
     min_pnl: f64,
     min_volume: f64,
+    min_realized_pnl: f64,
+    max_market_concentration: f64,
+    max_unrealized_ratio: f64,
     analysis_hours: u64,
     min_avg_interval_secs: f64,
     max_trades_in_window: usize,
     min_interval_stddev: f64,
     max_active_hour_ratio: f64,
     recent_window_hours: u64,
-    w_roi: f64,
+    max_notional_cv: f64,
+    min_market_diversity: f64,
+    max_size_p99_p50: f64,
+    pf_alpha: f64,
+    pf_beta: f64,
+    w_ret: f64,
     w_wr: f64,
     w_pf: f64,
     w_rr: f64,
+    w_dd: f64,
     min_copy_score: f64,
     require_closed_trades: bool,
     min_closed_trades: usize,
-) -> Vec<QualifiedTrader> {
-    let entries = match fetch_leaderboard(http, leaderboard_limit, period).await {
-        Ok(e) => e,
-        Err(err) => {
-            eprintln!("plan_c: fetch_leaderboard failed: {err}");
-            return Vec::new();
+    max_concurrency: usize,
+) -> (Vec<QualifiedTrader>, Vec<String>) {
+    let http_c = http.clone();
+    // Rate-limit outbound data-api calls. Too high → 429s and slow tails;
+    // too low → long wall-clock during discovery. 8 is a conservative default.
+    let semaphore = Arc::new(Semaphore::new(max_concurrency.max(1)));
+
+    let top20_snapshot: Vec<String> =
+        match fetch_leaderboard(&http_c, 20, "WEEK", "PNL").await {
+            Ok(v) => v
+                .into_iter()
+                .filter_map(|e| e.proxy_wallet.map(|a| a.trim().to_lowercase()))
+                .take(20)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+    let entries: Vec<LeaderboardEntry> = if use_multi_leaderboard {
+        // Do NOT silently `unwrap_or_default()` here — a 400/500 on any of the
+        // three sub-fetches has historically shown up as "leaderboard returned
+        // 0 entries" and cost an operator hours of confusion. Log and move on.
+        match fetch_leaderboard_candidate_pool(&http_c, per_list_limit, candidate_pool_max).await {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("plan_c: fetch_leaderboard_candidate_pool failed: {err}");
+                Vec::new()
+            }
+        }
+    } else {
+        match fetch_leaderboard(&http_c, leaderboard_limit, period, "PNL").await {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("plan_c: fetch_leaderboard failed: {err}");
+                return (Vec::new(), top20_snapshot);
+            }
         }
     };
 
+    let mode = if use_multi_leaderboard {
+        "multi_pool"
+    } else {
+        "single_period"
+    };
     println!(
-        "plan_c: leaderboard returned {} entries (period={}, min_pnl={}, min_vol={})",
+        "plan_c: leaderboard returned {} entries (mode={} period={} min_pnl={} min_vol={})",
         entries.len(),
+        mode,
         period,
         min_pnl,
         min_volume
     );
 
-    let mut candidates = Vec::new();
-    let mut filtered_pnl = 0;
-    let mut filtered_vol = 0;
-    let mut filtered_bot = 0;
-    let mut filtered_no_addr = 0;
-    let mut filtered_low_score = 0;
-    let mut filtered_no_closed = 0;
-    let mut analyzed = 0;
+    let mut futs = Vec::new();
+    for entry in entries {
+        let http = http_c.clone();
+        let sem = semaphore.clone();
+        futs.push(async move {
+            let address = match entry.proxy_wallet {
+                Some(ref a) if !a.trim().is_empty() => a.trim().to_string(),
+                _ => {
+                    return None;
+                }
+            };
+            let pnl = entry.pnl.unwrap_or(0.0);
+            let volume = entry.vol.unwrap_or(0.0);
+            let user_name = entry
+                .user_name
+                .clone()
+                .unwrap_or_else(|| address[..10.min(address.len())].to_string());
 
-    for entry in &entries {
-        let address = match &entry.proxy_wallet {
-            Some(a) if !a.trim().is_empty() => a.trim().to_string(),
-            _ => {
-                filtered_no_addr += 1;
-                continue;
+            if pnl < min_pnl || volume < min_volume {
+                return None;
             }
-        };
-        let pnl = entry.pnl.unwrap_or(0.0);
-        let volume = entry.vol.unwrap_or(0.0);
-        let user_name = entry
-            .user_name
-            .clone()
-            .unwrap_or_else(|| address[..10.min(address.len())].to_string());
 
-        if pnl < min_pnl {
-            filtered_pnl += 1;
-            continue;
-        }
-        if volume < min_volume {
-            filtered_vol += 1;
-            continue;
-        }
+            // Hold the permit for the remainder of this trader's HTTP work;
+            // release automatically on drop when this future resolves. This
+            // caps simultaneous trades-API + positions-API calls.
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return None,
+            };
 
-        analyzed += 1;
-        let trades = match fetch_user_trades(http, &address, 500).await {
-            Ok(t) => t,
-            Err(err) => {
-                eprintln!("plan_c: fetch_trades failed for {address}: {err}");
-                continue;
+            let trades = match fetch_user_trades(&http, &address, 500).await {
+                Ok(t) => t,
+                Err(err) => {
+                    eprintln!("plan_c: fetch_trades failed for {address}: {err}");
+                    return None;
+                }
+            };
+
+            let full = fifo_pnl_aggregate(&trades, None);
+            if full.net_realized < min_realized_pnl {
+                println!(
+                    "plan_c: FILTERED (low realized FIFO net) {} net={:.0} < {:.0}",
+                    user_name, full.net_realized, min_realized_pnl
+                );
+                return None;
             }
-        };
+            let conc = max_single_market_concentration(&full);
+            if conc > max_market_concentration {
+                println!(
+                    "plan_c: FILTERED (market concentration) {} max_cid_share={:.2} > {:.2}",
+                    user_name, conc, max_market_concentration
+                );
+                return None;
+            }
 
-        let analysis = analyze_trader_full(
-            &trades,
-            analysis_hours,
-            min_avg_interval_secs,
-            max_trades_in_window,
-            min_interval_stddev,
-            max_active_hour_ratio,
-            recent_window_hours,
-        );
+            if let Ok(Some(share)) = fetch_positions_unrealized_share(&http, &address).await {
+                if share > max_unrealized_ratio {
+                    println!(
+                        "plan_c: FILTERED (unrealized share) {} share={:.2} > {:.2}",
+                        user_name, share, max_unrealized_ratio
+                    );
+                    return None;
+                }
+            }
 
-        if analysis.is_bot {
-            filtered_bot += 1;
-            println!(
-                "plan_c: FILTERED (bot-like) {} (pnl={:.0} vol={:.0} trades={} avg_interval={:.0}s stddev={:.1} active_hr={:.2})",
-                user_name,
-                pnl,
-                volume,
-                analysis.trade_count,
-                analysis.avg_interval_secs,
-                analysis.interval_stddev,
-                analysis.active_hour_ratio
+            let analysis = analyze_trader_full(
+                &trades,
+                analysis_hours,
+                min_avg_interval_secs,
+                max_trades_in_window,
+                min_interval_stddev,
+                max_active_hour_ratio,
+                recent_window_hours,
+                max_notional_cv,
+                min_market_diversity,
+                max_size_p99_p50,
+                pf_alpha,
+                pf_beta,
             );
-            continue;
-        }
 
-        let roi = if volume > 0.0 { pnl / volume } else { 0.0 };
-        let score = compute_score(
-            roi,
-            analysis.win_rate,
-            analysis.profit_factor,
-            analysis.recent_roi,
-            w_roi,
-            w_wr,
-            w_pf,
-            w_rr,
-        );
-        let interval_display = if analysis.avg_interval_secs > 1e30 {
-            "n/a".to_string()
-        } else {
-            format!("{:.0}s", analysis.avg_interval_secs)
-        };
+            if analysis.is_bot {
+                println!(
+                    "plan_c: FILTERED (bot-like) {} (pnl={:.0} vol={:.0} trades={} avg_interval={:.0}s div={:.2} ncv={:.2})",
+                    user_name,
+                    pnl,
+                    volume,
+                    analysis.trade_count,
+                    analysis.avg_interval_secs,
+                    analysis.market_diversity,
+                    analysis.notional_cv
+                );
+                return None;
+            }
 
-        // --- New quality gates (方案 3) ---
-        //
-        // 1) require_closed_trades: drop accounts whose FIFO history produced
-        //    fewer than `min_closed_trades` paired BUY→SELL lots.  When 0,
-        //    win_rate / profit_factor are placeholder zeros that badly distort
-        //    the score and we effectively can't tell a winner from a loser.
-        //
-        // 2) min_copy_score: drop accounts whose composite score is below the
-        //    floor. Previously any QUALIFIED trader could win a copy slot as
-        //    long as no higher-scored peer also produced a fresh BUY this
-        //    round — low-score but active accounts were leaking through.
-        if require_closed_trades && analysis.closed_trade_count < min_closed_trades {
-            filtered_no_closed += 1;
-            println!(
-                "plan_c: FILTERED (insufficient stats) {} (score={:.2} closed_trades={} < {} pnl={:.0} vol={:.0} trades={} avg_interval={})",
-                user_name,
-                score,
-                analysis.closed_trade_count,
-                min_closed_trades,
-                pnl,
-                volume,
-                analysis.trade_count,
-                interval_display,
-            );
-            continue;
-        }
-        if score < min_copy_score {
-            filtered_low_score += 1;
-            println!(
-                "plan_c: FILTERED (low score) {} (score={:.2} < {:.2} roi={:.2} wr={:.2} pf={:.2} recent_roi={:.2} closed_trades={} pnl={:.0})",
-                user_name,
-                score,
-                min_copy_score,
-                roi,
-                analysis.win_rate,
+            let dd_penalty =
+                (full.max_drawdown / full.net_realized.abs().max(1.0)).clamp(0.0, 1.0);
+            let score = compute_score_v2(
+                analysis.sharpe_7d,
+                analysis.wilson_wr_lcb,
                 analysis.profit_factor,
                 analysis.recent_roi,
+                dd_penalty,
+                w_ret,
+                w_wr,
+                w_pf,
+                w_rr,
+                w_dd,
+            );
+
+            let interval_display = if analysis.avg_interval_secs > 1e30 {
+                "n/a".to_string()
+            } else {
+                format!("{:.0}s", analysis.avg_interval_secs)
+            };
+
+            if require_closed_trades && analysis.closed_trade_count < min_closed_trades {
+                println!(
+                    "plan_c: FILTERED (insufficient stats) {} (score={:.2} closed={} < {})",
+                    user_name, score, analysis.closed_trade_count, min_closed_trades
+                );
+                return None;
+            }
+            if score < min_copy_score {
+                println!(
+                    "plan_c: FILTERED (low score) {} score={:.2} < {:.2} wr_lcb={:.2} pf={:.2} rr={:.2}",
+                    user_name,
+                    score,
+                    min_copy_score,
+                    analysis.wilson_wr_lcb,
+                    analysis.profit_factor,
+                    analysis.recent_roi,
+                );
+                return None;
+            }
+
+            println!(
+                "plan_c: QUALIFIED {} (score={:.2} sharpe7d={:.2} wr_lcb={:.2} pf={:.2} rr={:.2} dd_pen={:.2} closed={} pnl={:.0} vol={:.0} trades={} avg={})",
+                user_name,
+                score,
+                analysis.sharpe_7d,
+                analysis.wilson_wr_lcb,
+                analysis.profit_factor,
+                analysis.recent_roi,
+                dd_penalty,
                 analysis.closed_trade_count,
                 pnl,
+                volume,
+                analysis.trade_count,
+                interval_display
             );
-            continue;
-        }
 
-        println!(
-            "plan_c: QUALIFIED {} (score={:.2} roi={:.2} wr={:.2} pf={:.2} recent_roi={:.2} closed_trades={} pnl={:.0} vol={:.0} trades={} avg_interval={} stddev={:.1} active_hr={:.2})",
-            user_name,
-            score,
-            roi,
-            analysis.win_rate,
-            analysis.profit_factor,
-            analysis.recent_roi,
-            analysis.closed_trade_count,
-            pnl,
-            volume,
-            analysis.trade_count,
-            interval_display,
-            analysis.interval_stddev,
-            analysis.active_hour_ratio
-        );
-        candidates.push(QualifiedTrader {
-            address,
-            user_name,
-            pnl,
-            volume,
-            avg_interval_secs: analysis.avg_interval_secs,
-            trade_count: analysis.trade_count,
-            roi,
-            win_rate: analysis.win_rate,
-            profit_factor: analysis.profit_factor,
-            recent_roi: analysis.recent_roi,
-            score,
+            let roi = if volume > 0.0 { pnl / volume } else { 0.0 };
+            Some(QualifiedTrader {
+                address,
+                user_name,
+                pnl,
+                volume,
+                avg_interval_secs: analysis.avg_interval_secs,
+                trade_count: analysis.trade_count,
+                roi,
+                sharpe_7d: analysis.sharpe_7d,
+                ret_7d: analysis.ret_7d,
+                win_rate: analysis.wilson_wr_lcb,
+                profit_factor: analysis.profit_factor,
+                recent_roi: analysis.recent_roi,
+                max_drawdown: full.max_drawdown,
+                score,
+            })
         });
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
+    let raw: Vec<Option<QualifiedTrader>> = join_all(futs).await;
+    let mut candidates: Vec<QualifiedTrader> = raw.into_iter().flatten().collect();
     candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     println!(
-        "plan_c: discovery complete — total={} no_addr={} low_pnl={} low_vol={} analyzed={} bot_like={} no_closed={} low_score={} qualified={}",
-        entries.len(),
-        filtered_no_addr,
-        filtered_pnl,
-        filtered_vol,
-        analyzed,
-        filtered_bot,
-        filtered_no_closed,
-        filtered_low_score,
+        "plan_c: discovery complete — qualified={} (parallel pool)",
         candidates.len()
     );
 
-    candidates
+    (candidates, top20_snapshot)
 }
 
 pub(crate) async fn run_plan_c_loop<C>(
@@ -1856,8 +2259,26 @@ pub(crate) async fn run_plan_c_loop<C>(
     let period_raw = resolve_runtime_var("PLAN_C_LEADERBOARD_PERIOD", dotenv_path)
         .unwrap_or_else(|| "weekly".to_string());
     let period = period_raw.trim().to_string();
-    let min_pnl = read_f64_env_or(dotenv_path, "PLAN_C_MIN_PNL", 500.0);
-    let min_volume = read_f64_env_or(dotenv_path, "PLAN_C_MIN_VOLUME", 5000.0);
+    let min_pnl = read_f64_env_or(dotenv_path, "PLAN_C_MIN_PNL", 2000.0);
+    let min_volume = read_f64_env_or(dotenv_path, "PLAN_C_MIN_VOLUME", 50000.0);
+    let min_realized_pnl = read_f64_env_or(dotenv_path, "PLAN_C_MIN_REALIZED_PNL", 500.0);
+    let max_market_concentration =
+        read_f64_env_or(dotenv_path, "PLAN_C_MAX_MARKET_CONCENTRATION", 0.60);
+    let max_unrealized_ratio = read_f64_env_or(dotenv_path, "PLAN_C_MAX_UNREALIZED_RATIO", 0.70);
+    let use_multi_leaderboard =
+        crate::read_bool_env_or(dotenv_path, "PLAN_C_USE_MULTI_LEADERBOARD", true);
+    let candidate_pool_max = read_u64_env_or(dotenv_path, "PLAN_C_CANDIDATE_POOL_MAX", 120) as usize;
+    let max_notional_cv = read_f64_env_or(dotenv_path, "PLAN_C_MAX_NOTIONAL_CV", 0.15);
+    let min_market_diversity = read_f64_env_or(dotenv_path, "PLAN_C_MIN_MARKET_DIVERSITY", 0.10);
+    let max_size_p99_p50 = read_f64_env_or(dotenv_path, "PLAN_C_MAX_SIZE_P99_P50", 20.0);
+    let pf_alpha = read_f64_env_or(dotenv_path, "PLAN_C_PF_ALPHA", 50.0);
+    let pf_beta = read_f64_env_or(dotenv_path, "PLAN_C_PF_BETA", 50.0);
+    let refresh_churn_threshold =
+        read_f64_env_or(dotenv_path, "PLAN_C_REFRESH_CHURN_THRESHOLD", 0.30);
+    // Keep default conservative to avoid 429s on the data-api; bump to 16 on
+    // a warm network. Set to 1 to effectively serialise (regression harness).
+    let analyze_concurrency =
+        read_u64_env_or(dotenv_path, "PLAN_C_ANALYZE_CONCURRENCY", 8) as usize;
     let analysis_hours = read_u64_env_or(dotenv_path, "PLAN_C_ANALYSIS_HOURS", 24);
     let min_avg_interval_secs =
         read_f64_env_or(dotenv_path, "PLAN_C_MIN_AVG_INTERVAL_SECS", 120.0);
@@ -1870,11 +2291,22 @@ pub(crate) async fn run_plan_c_loop<C>(
     let recent_window_hours =
         read_u64_env_or(dotenv_path, "PLAN_C_RECENT_WINDOW_HOURS", 168);
     let max_trade_age_secs = read_u64_env_or(dotenv_path, "PLAN_C_MAX_TRADE_AGE_SECS", 180) as i64;
-    let w_roi = read_f64_env_or(dotenv_path, "PLAN_C_W_ROI", 0.30);
+    let w_ret = read_f64_env_or(dotenv_path, "PLAN_C_W_ROI", 0.25);
     let w_wr = read_f64_env_or(dotenv_path, "PLAN_C_W_WIN_RATE", 0.25);
     let w_pf = read_f64_env_or(dotenv_path, "PLAN_C_W_PROFIT_FACTOR", 0.20);
-    let w_rr = read_f64_env_or(dotenv_path, "PLAN_C_W_RECENT_ROI", 0.25);
-    let order_usd = read_decimal_env_or(dotenv_path, "PLAN_C_ORDER_USD", Decimal::from(5_u32));
+    let w_rr = read_f64_env_or(dotenv_path, "PLAN_C_W_RECENT_ROI", 0.15);
+    let w_dd = read_f64_env_or(dotenv_path, "PLAN_C_W_DRAWDOWN", 0.15);
+    let order_usd_base = if let Some(s) = resolve_runtime_var("PLAN_C_ORDER_USD_BASE", dotenv_path) {
+        Decimal::from_str(s.trim()).unwrap_or_else(|_| Decimal::from(5_u32))
+    } else {
+        read_decimal_env_or(dotenv_path, "PLAN_C_ORDER_USD", Decimal::from(5_u32))
+    };
+    let order_usd_min =
+        read_decimal_env_or(dotenv_path, "PLAN_C_ORDER_USD_MIN", Decimal::from(3_u32));
+    let order_usd_max =
+        read_decimal_env_or(dotenv_path, "PLAN_C_ORDER_USD_MAX", Decimal::from(25_u32));
+    let min_leader_notional =
+        read_f64_env_or(dotenv_path, "PLAN_C_MIN_LEADER_NOTIONAL", 100.0);
     let poll_secs = read_u64_env_or(dotenv_path, "PLAN_C_POLL_SECS", 30);
     let stop_loss_pct = read_decimal_env_or(
         dotenv_path,
@@ -1966,7 +2398,7 @@ pub(crate) async fn run_plan_c_loop<C>(
         Decimal::from_str("0.02").unwrap_or(Decimal::ZERO),
     );
     let max_per_trader = read_u64_env_or(dotenv_path, "PLAN_C_MAX_PER_TRADER", 2) as usize;
-    let refresh_leaders_secs = read_u64_env_or(dotenv_path, "PLAN_C_REFRESH_LEADERS_SECS", 3600);
+    let refresh_leaders_secs = read_u64_env_or(dotenv_path, "PLAN_C_REFRESH_LEADERS_SECS", 1200);
     let exit_mode = parse_exit_mode(resolve_runtime_var("PLAN_C_EXIT_MODE", dotenv_path));
     let leader_sell_max_age_secs =
         read_u64_env_or(dotenv_path, "PLAN_C_LEADER_SELL_MAX_AGE_SECS", 300) as i64;
@@ -1978,19 +2410,26 @@ pub(crate) async fn run_plan_c_loop<C>(
     // Previously score was only used for priority sorting, so any non-bot
     // account with a stale fresh BUY could grab a slot regardless of how
     // meaningless its wr/pf/recent_roi were.
-    let min_copy_score = read_f64_env_or(dotenv_path, "PLAN_C_MIN_COPY_SCORE", 0.35);
+    let min_copy_score = read_f64_env_or(dotenv_path, "PLAN_C_MIN_COPY_SCORE", 0.45);
     let require_closed_trades =
         crate::read_bool_env_or(dotenv_path, "PLAN_C_REQUIRE_CLOSED_TRADES", true);
     let min_closed_trades =
-        read_u64_env_or(dotenv_path, "PLAN_C_MIN_CLOSED_TRADES", 3) as usize;
+        read_u64_env_or(dotenv_path, "PLAN_C_MIN_CLOSED_TRADES", 10) as usize;
 
-    println!("plan_c: leaderboard_limit={leaderboard_limit} period={period}");
-    println!("plan_c: min_pnl={min_pnl} min_volume={min_volume}");
+    println!("plan_c: leaderboard_limit={leaderboard_limit} candidate_pool_max={candidate_pool_max} period={period} multi_lb={use_multi_leaderboard}");
+    println!("plan_c: min_pnl={min_pnl} min_volume={min_volume} min_realized_pnl={min_realized_pnl} max_mkt_conc={max_market_concentration} max_unreal={max_unrealized_ratio}");
     println!("plan_c: analysis_hours={analysis_hours} min_avg_interval={min_avg_interval_secs}s max_trades_in_window={max_trades_in_window}");
-    println!("plan_c: bot_filters min_interval_stddev={min_interval_stddev} max_active_hour_ratio={max_active_hour_ratio}");
+    println!("plan_c: bot_filters min_interval_stddev={min_interval_stddev} max_active_hour_ratio={max_active_hour_ratio} max_ncv={max_notional_cv} min_div={min_market_diversity} max_p99p50={max_size_p99_p50}");
     println!("plan_c: recent_window_hours={recent_window_hours} max_trade_age_secs={max_trade_age_secs}");
-    println!("plan_c: score_weights w_roi={w_roi} w_win_rate={w_wr} w_profit_factor={w_pf} w_recent_roi={w_rr}");
-    println!("plan_c: order_usd={order_usd} poll_secs={poll_secs}");
+    println!("plan_c: score_weights w_ret={w_ret} w_win_rate={w_wr} w_profit_factor={w_pf} w_recent_roi={w_rr} w_dd={w_dd}");
+    println!(
+        "plan_c: order_usd base={} min={} max={} min_leader_notional={} poll_secs={}",
+        order_usd_base,
+        order_usd_min,
+        order_usd_max,
+        min_leader_notional,
+        poll_secs
+    );
     println!("plan_c: stop_loss={stop_loss_pct} take_profit={take_profit_pct} max_positions={max_positions}");
     println!("plan_c: buy_slippage={buy_slippage} max_per_trader={max_per_trader} refresh_leaders={refresh_leaders_secs}s");
     println!(
@@ -2214,6 +2653,7 @@ pub(crate) async fn run_plan_c_loop<C>(
 
     let mut qualified_traders: Vec<QualifiedTrader> = Vec::new();
     let mut last_leader_refresh: i64 = 0;
+    let mut last_top20_snapshot: Vec<String> = Vec::new();
     let round_log_path = Path::new("data/plan_c_rounds.jsonl");
 
     let mut loop_idx: u64 = 0;
@@ -2221,32 +2661,69 @@ pub(crate) async fn run_plan_c_loop<C>(
         loop_idx += 1;
         let now = Utc::now().timestamp();
 
-        if now - last_leader_refresh >= refresh_leaders_secs as i64 || qualified_traders.is_empty()
+        let mut force_refresh = false;
+        if !last_top20_snapshot.is_empty() && !qualified_traders.is_empty() {
+            if let Ok(snap_entries) = fetch_leaderboard(&http, 20, "WEEK", "PNL").await {
+                let new_snap: Vec<String> = snap_entries
+                    .into_iter()
+                    .filter_map(|e| e.proxy_wallet.map(|a| a.trim().to_lowercase()))
+                    .take(20)
+                    .collect();
+                let overlap = leaderboard_top_overlap(&last_top20_snapshot, &new_snap);
+                if overlap < 1.0 - refresh_churn_threshold {
+                    println!(
+                        "plan_c: WEEK PNL top-20 churn (overlap={:.2} < {:.2}) — forcing leader refresh",
+                        overlap,
+                        1.0 - refresh_churn_threshold
+                    );
+                    force_refresh = true;
+                }
+            }
+        }
+
+        if force_refresh
+            || now - last_leader_refresh >= refresh_leaders_secs as i64
+            || qualified_traders.is_empty()
         {
             println!(
                 "\n================ plan_c round #{loop_idx} — refreshing leaders ================\n"
             );
-            qualified_traders = discover_qualified_traders(
+            let (q, top20) = discover_qualified_traders(
                 &http,
+                use_multi_leaderboard,
+                leaderboard_limit,
+                candidate_pool_max,
                 leaderboard_limit,
                 &period,
                 min_pnl,
                 min_volume,
+                min_realized_pnl,
+                max_market_concentration,
+                max_unrealized_ratio,
                 analysis_hours,
                 min_avg_interval_secs,
                 max_trades_in_window,
                 min_interval_stddev,
                 max_active_hour_ratio,
                 recent_window_hours,
-                w_roi,
+                max_notional_cv,
+                min_market_diversity,
+                max_size_p99_p50,
+                pf_alpha,
+                pf_beta,
+                w_ret,
                 w_wr,
                 w_pf,
                 w_rr,
+                w_dd,
                 min_copy_score,
                 require_closed_trades,
                 min_closed_trades,
+                analyze_concurrency,
             )
             .await;
+            qualified_traders = q;
+            last_top20_snapshot = top20;
             last_leader_refresh = now;
 
             if qualified_traders.is_empty() {
@@ -2864,6 +3341,25 @@ pub(crate) async fn run_plan_c_loop<C>(
             // order which roughly follows leaderboard order from step 1.
             pending.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
+            // Step 2b: de-correlate — at most one pending BUY per `condition_id` (best score kept).
+            let mut seen_cid: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut unique_pending: Vec<(f64, usize, TradeRecord)> = Vec::new();
+            for triple in pending {
+                let cid_opt = triple
+                    .2
+                    .condition_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if let Some(cid) = cid_opt {
+                    if !seen_cid.insert(cid.to_string()) {
+                        continue;
+                    }
+                }
+                unique_pending.push(triple);
+            }
+            pending = unique_pending;
+
             // Cash-reserve safety: if we couldn't confirm free USDC and the operator
             // opted in to strict blocking, drop every candidate for this round.
             // Signals stay un-marked so they can be reconsidered once RPC recovers
@@ -2964,7 +3460,32 @@ pub(crate) async fn run_plan_c_loop<C>(
                     mark_processed(&trader.address, trade_ts);
                     continue;
                 }
-                let size = (order_usd / buy_price).round_dp(2);
+
+                let leader_notional_f = trade
+                    .usdc_size
+                    .unwrap_or(0.0)
+                    .max(trade.size.unwrap_or(0.0).abs() * trade.price.unwrap_or(0.0));
+                if leader_notional_f < min_leader_notional {
+                    println!(
+                        "plan_c: SKIP (leader notional {:.2} < min {:.2}) — trader={}",
+                        leader_notional_f, min_leader_notional, trader.user_name
+                    );
+                    mark_processed(&trader.address, trade_ts);
+                    continue;
+                }
+
+                let scale_raw = (leader_notional_f / 100.0).log10().clamp(0.5, 3.0);
+                let scale_dec = Decimal::from_str(&format!("{scale_raw:.6}"))
+                    .unwrap_or(Decimal::ONE);
+                let mut order_usd_this = (order_usd_base * scale_dec).round_dp(2);
+                if order_usd_this < order_usd_min {
+                    order_usd_this = order_usd_min;
+                }
+                if order_usd_this > order_usd_max {
+                    order_usd_this = order_usd_max;
+                }
+
+                let size = (order_usd_this / buy_price).round_dp(2);
                 if size < Decimal::from(1_u32) {
                     mark_processed(&trader.address, trade_ts);
                     continue;
@@ -3013,19 +3534,23 @@ pub(crate) async fn run_plan_c_loop<C>(
                 let age_secs = (collection_now - trade_ts).max(0);
 
                 println!(
-                    "plan_c: COPY BUY — trader={} (score={:.2} roi={:.2} wr={:.2} pf={:.2} recent_roi={:.2}) market=\"{}\" outcome={} price={} size={} age={}s (leader pnl={:.0})",
+                    "plan_c: COPY BUY — trader={} (score={:.2} rot={:.4} sharpe7d={:.2} wr_lcb={:.2} pf={:.2} recent_roi={:.2} max_dd={:.0}) market=\"{}\" outcome={} order_usd={} price={} size={} age={}s (leader pnl={:.0} leader_notional=${:.0})",
                     trader.user_name,
                     score,
                     trader.roi,
+                    trader.sharpe_7d,
                     trader.win_rate,
                     trader.profit_factor,
                     trader.recent_roi,
+                    trader.max_drawdown,
                     trade_title,
                     trade_outcome,
+                    order_usd_this,
                     buy_price,
                     size,
                     age_secs,
-                    trader.pnl
+                    trader.pnl,
+                    leader_notional_f
                 );
 
                 let mut risk_ctx = context.clone();
@@ -3229,5 +3754,149 @@ pub(crate) async fn run_plan_c_loop<C>(
             poll_secs
         );
         time::sleep(Duration::from_secs(poll_secs)).await;
+    }
+}
+
+#[cfg(test)]
+mod plan_c_algorithm_tests {
+    use super::*;
+
+    fn tr(
+        side: &str,
+        cid: &str,
+        asset: &str,
+        price: f64,
+        size: f64,
+        ts: i64,
+    ) -> TradeRecord {
+        TradeRecord {
+            proxy_wallet: None,
+            side: Some(side.to_string()),
+            asset: Some(asset.to_string()),
+            condition_id: Some(cid.to_string()),
+            size: Some(size),
+            price: Some(price),
+            timestamp: Some(ts),
+            title: None,
+            slug: None,
+            outcome_index: None,
+            outcome: None,
+            usdc_size: None,
+        }
+    }
+
+    #[test]
+    fn wilson_lcb_below_point_estimate() {
+        let w = wilson_lower_bound(8, 10, 1.96);
+        assert!(w < 0.8, "LCB should be conservative: {w}");
+        assert!(w > 0.3);
+    }
+
+    #[test]
+    fn fifo_aggregate_counts_one_close() {
+        let trades = vec![
+            tr("BUY", "c1", "a1", 0.40, 100.0, 1000),
+            tr("SELL", "c1", "a1", 0.60, 100.0, 1100),
+        ];
+        let a = fifo_pnl_aggregate(&trades, None);
+        assert_eq!(a.total, 1);
+        assert_eq!(a.wins, 1);
+        assert!((a.gross_profit - 20.0).abs() < 1e-6);
+        assert!(a.max_drawdown >= 0.0);
+    }
+
+    #[test]
+    fn profit_factor_shrinkage_stable() {
+        let p = profit_factor_shrinkage(100.0, 50.0, 50.0, 50.0);
+        assert!((p - 1.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_score_v2_in_range() {
+        let s = compute_score_v2(1.0, 0.5, 2.0, 0.1, 0.2, 0.25, 0.25, 0.2, 0.15, 0.15);
+        assert!(s > 0.0 && s <= 1.5, "score={s}");
+    }
+
+    #[test]
+    fn max_drawdown_from_events_detects_loss() {
+        let ev = vec![(1_i64, 10.0), (2, -30.0), (3, 5.0)];
+        let dd = max_drawdown_from_equity_events(&ev);
+        assert!(dd >= 20.0);
+    }
+
+    #[test]
+    fn buy_notional_since_sums_buys() {
+        let t = vec![
+            tr("BUY", "c", "a", 0.5, 10.0, 2000),
+            tr("SELL", "c", "a", 0.7, 10.0, 2100),
+        ];
+        let n = buy_notional_since(&t, 1990, 3000);
+        assert!((n - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn leaderboard_overlap_identical() {
+        let a = vec!["x".to_string(), "y".to_string()];
+        let b = vec!["x".to_string(), "y".to_string()];
+        assert!((leaderboard_top_overlap(&a, &b) - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn retention_norm_clamp() {
+        assert!((retention_norm(0.0, -1.0, 1.0) - 0.5).abs() < 1e-9);
+    }
+
+    /// Neg-risk hedged position collapses to zero-pnl closure instead of being
+    /// counted as two independent trades.
+    #[test]
+    fn fifo_neg_risk_perfect_hedge_nets_zero() {
+        // Make `yes_a` the canonical YES by giving it more trades (majority).
+        let trades = vec![
+            tr("BUY", "c1", "yes_a", 0.30, 100.0, 1000),
+            tr("BUY", "c1", "no_a", 0.70, 100.0, 1100), // -> canon SELL YES @ 0.30
+            tr("SELL", "c1", "yes_a", 0.30, 1.0, 1200), // filler so yes_a majority
+        ];
+        let a = fifo_pnl_aggregate(&trades, None);
+        assert_eq!(a.wins, 0, "hedge is not a win: gp={} gl={}", a.gross_profit, a.gross_loss);
+        assert!(a.gross_profit.abs() < 1e-6);
+        assert!(a.gross_loss.abs() < 1e-6);
+        // NO BUY closes the YES lot entirely → the later filler SELL YES has
+        // no inventory to match, so exactly one closure is recorded at pnl=0.
+        assert_eq!(a.total, 1);
+    }
+
+    /// Regression: data-api rejects `VOLUME` with HTTP 400. We must query
+    /// using the literal `VOL`. This test pins the constant string inside
+    /// `fetch_leaderboard_candidate_pool` so a future "clarifying rename"
+    /// back to `VOLUME` fails loudly in CI instead of silently emptying the
+    /// candidate pool in production.
+    #[test]
+    fn leaderboard_candidate_pool_uses_vol_orderby() {
+        let src = include_str!("plan_c.rs");
+        assert!(
+            src.contains("fetch_leaderboard(http, per_list_limit, \"WEEK\", \"VOL\")"),
+            "candidate pool must use orderBy=VOL (data-api rejects VOLUME)"
+        );
+        assert!(
+            !src.contains("\"WEEK\", \"VOLUME\""),
+            "orderBy=VOLUME is rejected by polymarket data-api with HTTP 400"
+        );
+    }
+
+    /// Cross-asset: BUY YES then SELL NO flips to BUY YES; a later SELL YES
+    /// closes both lots with a single closure counted once.
+    #[test]
+    fn fifo_neg_risk_cross_asset_profit() {
+        let trades = vec![
+            tr("BUY", "c2", "yes_a", 0.30, 100.0, 1000),
+            tr("SELL", "c2", "no_a", 0.20, 100.0, 1050), // -> canon BUY YES @ 0.80
+            tr("SELL", "c2", "yes_a", 0.50, 150.0, 1200),
+        ];
+        let a = fifo_pnl_aggregate(&trades, None);
+        assert_eq!(a.total, 1, "single SELL trade = single closure");
+        // pnl = (0.50-0.30)*100 + (0.50-0.80)*50 = 20 - 15 = 5
+        assert!((a.gross_profit - 5.0).abs() < 1e-6, "gp={}", a.gross_profit);
+        assert!(a.gross_loss.abs() < 1e-6);
+        assert_eq!(a.wins, 1);
     }
 }
