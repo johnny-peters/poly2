@@ -75,6 +75,221 @@ fn conservative_sell_size(raw: Decimal) -> Decimal {
     }
 }
 
+/// What the caller should do with a position after a sell submit failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SellFailAction {
+    /// Size was re-synced from the error payload and the position still has
+    /// enough shares to be worth retrying next round. Keep it in state.
+    RetryNextRound,
+    /// The authoritative balance (from the exchange or a downstream reconcile)
+    /// is below the minimum tradable size. Drop the position: it's effectively
+    /// dust the bot can't close anyway, and staying around just spams the log.
+    DropPosition,
+    /// `sell_fail_count` has crossed the reconcile threshold without a
+    /// self-healing balance in the error payload. The caller should trigger
+    /// an immediate `fetch_onchain_positions` + `reconcile_positions` pass.
+    TriggerReconcile,
+}
+
+/// Handle a sell-submit failure in a self-healing way. Updates the position's
+/// counters + size in place and returns a directive for the caller. Keeps the
+/// three sell sites (leader-exit / stop-loss / take-profit) in lockstep.
+///
+/// * `parse_balance_from_error` tries to extract the on-chain balance the
+///   exchange reported. When present we overwrite `pos.size` so the NEXT poll
+///   sends a correctly-sized order — no more "balance: 3600, order amount:
+///   170000" loops.
+/// * When balance < `min_tradable_size` (conservative_sell_size can't produce
+///   anything smaller than 0.01 shares anyway), we ask the caller to drop the
+///   position entirely.
+/// * When the error isn't a balance-mismatch and the retry counter crosses
+///   `reconcile_after`, we ask the caller to re-sync the whole book from
+///   on-chain. That catches the case where the SDK returned a generic
+///   `Status: error` that hides the real balance.
+fn handle_sell_failure(
+    pos: &mut CopiedPosition,
+    err: &str,
+    min_tradable_size: Decimal,
+    reconcile_after: u32,
+    drop_after: u32,
+) -> SellFailAction {
+    pos.sell_fail_count = pos.sell_fail_count.saturating_add(1);
+
+    if let Some(onchain_size) = parse_balance_from_error(err) {
+        if onchain_size < pos.size {
+            eprintln!(
+                "plan_c: sell error reports balance={} (was size={}) — re-syncing local state from exchange",
+                onchain_size, pos.size
+            );
+            pos.size = onchain_size;
+        }
+        if pos.size < min_tradable_size {
+            eprintln!(
+                "plan_c: on-chain balance {} below min tradable size {} — dropping position market={} token={}",
+                pos.size,
+                min_tradable_size,
+                pos.market_id,
+                short_token(&pos.token_id),
+            );
+            return SellFailAction::DropPosition;
+        }
+        // Reset the stall counter because we made actionable progress.
+        pos.sell_fail_count = 0;
+        return SellFailAction::RetryNextRound;
+    }
+
+    // Couldn't parse — escalate if we've been spinning.
+    if drop_after > 0 && pos.sell_fail_count >= drop_after {
+        eprintln!(
+            "plan_c: sell failed {} times without a self-healing signal — dropping position market={} token={}",
+            pos.sell_fail_count,
+            pos.market_id,
+            short_token(&pos.token_id),
+        );
+        return SellFailAction::DropPosition;
+    }
+    if reconcile_after > 0 && pos.sell_fail_count >= reconcile_after {
+        return SellFailAction::TriggerReconcile;
+    }
+    SellFailAction::RetryNextRound
+}
+
+/// Polymarket CLOB encodes ERC-1155 token amounts in 6-decimal fixed point
+/// (1_000_000 raw units = 1 share). Used by `parse_balance_from_error` to
+/// translate the exchange's raw `balance:` value back into share units.
+const SHARE_DECIMALS_DIVISOR: u64 = 1_000_000;
+
+/// Attempts to extract the true on-chain token balance (in share units) from
+/// a Polymarket CLOB `not enough balance / allowance` error message.
+///
+/// The error body produced by the SDK looks like:
+///   `{"error":"not enough balance / allowance: the balance is not enough -> balance: 3600, order amount: 170000"}`
+///
+/// We parse out `balance: <N>` and convert from raw 6-decimal units to shares.
+/// Returns `None` if the error doesn't contain a parseable `balance:` field
+/// (i.e. this is a different class of failure — network blip, rate-limit, etc.).
+///
+/// Why we care: historically when the on-chain balance drifted below the
+/// locally-tracked `pos.size` (partial fills, manual exits, reconcile lag),
+/// the bot would pound the `/order` endpoint forever with the same stale
+/// order_amount. Re-syncing the local state from the exchange's own
+/// authoritative balance number lets the very next retry succeed.
+fn parse_balance_from_error(err: &str) -> Option<Decimal> {
+    // Find the first `balance:` marker, then read the integer that follows.
+    // We tolerate surrounding whitespace and quoting (JSON body vs. bare text).
+    let idx = err.find("balance:")?;
+    let tail = &err[idx + "balance:".len()..];
+    let digits: String = tail
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let raw: u64 = digits.parse().ok()?;
+    // Convert 6-decimal fixed point to share units.
+    Some(Decimal::from(raw) / Decimal::from(SHARE_DECIMALS_DIVISOR))
+}
+
+/// Default blocklist of title / slug substrings the bot will refuse to copy.
+///
+/// Esports markets on Polymarket (LoL / Dota / CS / Valorant / etc.) have
+/// historically produced ~90% losing copies: they settle in minutes, the book
+/// is thin, and the "leaders" we follow are often routing around promo
+/// liquidity rather than betting on outcome. Block by default; ops can
+/// override with `PLAN_C_BLOCKED_KEYWORDS` (empty string = disable all filters).
+///
+/// Matching is case-insensitive substring on either `title` or `slug`. Keep
+/// keywords specific enough to avoid blocking political or sports markets
+/// (e.g. use "lol:" / "lol " rather than bare "lol" which would match "Lola").
+const DEFAULT_BLOCKED_MARKET_KEYWORDS: &[&str] = &[
+    // League of Legends — title always prefixed "LoL:" / "LoL " / slug "lol-"
+    "lol:",
+    "lol ",
+    "-lol-",
+    "league-of-legends",
+    "league of legends",
+    // Dota 2
+    "dota",
+    // Counter-Strike (CS2 / CS:GO)
+    "cs2",
+    "cs:go",
+    "cs ",
+    "counter-strike",
+    "counter strike",
+    // Valorant / Rainbow Six / Overwatch / Rocket League
+    "valorant",
+    "rainbow six",
+    "overwatch",
+    "rocket league",
+    // Tournament / league abbreviations that are unambiguously esports
+    "lpl",
+    "lcs",
+    "lec",
+    "lck",
+    "msi ",
+    "worlds ",
+    "esl ",
+    "blast ",
+    // Umbrella categorization strings sometimes embedded in titles
+    "esports",
+    "e-sports",
+];
+
+/// Parse a comma-separated override list from env into lowercase keywords.
+/// Empty / whitespace-only tokens are dropped. Useful for both "replace the
+/// default list" and "disable filtering entirely" (set to a single space).
+fn parse_blocked_keywords_override(raw: Option<String>) -> Option<Vec<String>> {
+    let raw = raw?;
+    let parts: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Explicitly-empty env (e.g. `PLAN_C_BLOCKED_KEYWORDS=`) means "no
+    // override": fall back to defaults. An env containing at least one
+    // non-empty token wins. To disable filtering set e.g. `=__none__`.
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts)
+}
+
+/// Returns true if the given market (by its copy-candidate metadata) matches
+/// any of the configured blocklist keywords. Used to hard-veto copy-buy
+/// signals for markets the operator considers unprofitable on principle
+/// (esports by default — see `DEFAULT_BLOCKED_MARKET_KEYWORDS`).
+///
+/// * Matches are case-insensitive substring on the concatenated
+///   `"<title> || <slug>"` haystack, so either field can carry the signal.
+/// * Single-token sentinel `__none__` in the override list disables all
+///   filtering (useful for integration tests / operators who want to trade
+///   everything manually).
+fn is_blocked_market(title: Option<&str>, slug: Option<&str>, blocklist: &[String]) -> bool {
+    if blocklist.is_empty() || blocklist.iter().any(|k| k == "__none__") {
+        return false;
+    }
+    let t = title.unwrap_or("").to_ascii_lowercase();
+    let s = slug.unwrap_or("").to_ascii_lowercase();
+    if t.is_empty() && s.is_empty() {
+        return false;
+    }
+    // Build two haystacks: the raw concat (so keywords like "lol:" that rely
+    // on punctuation still work) and a version where every non-alnum char
+    // becomes a space (so slug-style "lol-worlds-2026-winner" matches a
+    // keyword like "lol " that's anchored for readability in titles). Either
+    // match vetoes the trade.
+    let raw = format!("{} || {}", t, s);
+    let normalized: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect();
+    blocklist
+        .iter()
+        .any(|kw| raw.contains(kw) || normalized.contains(kw))
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[allow(dead_code)]
 struct LeaderboardEntry {
@@ -141,6 +356,10 @@ struct QualifiedTrader {
     recent_roi: f64,
     max_drawdown: f64,
     score: f64,
+    /// True iff FIFO net realized is positive in every configured window (e.g. 7/30/90d).
+    persistent_profit: bool,
+    /// Per-window net realized (diagnostic / logging), same order as `PLAN_C_PERSIST_WINDOWS_DAYS`.
+    window_nets: Vec<(u64, f64)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -210,6 +429,11 @@ struct CopiedPosition {
     /// Consecutive rounds where `fetch_clob_best_bid` failed for this token.
     /// When it crosses `clob_fail_threshold` we treat the market as closed/resolved.
     clob_fail_count: u32,
+    /// Consecutive failed sell attempts (leader-exit / stop-loss / take-profit).
+    /// Used to (a) trigger a mid-run reconcile after `sell_fail_reconcile_after`
+    /// and (b) drop a position after `sell_fail_drop_after` when even the
+    /// reconcile can't bring it back into sync (avoids log-spam loops).
+    sell_fail_count: u32,
     /// How many times redeem has been attempted without success.
     redeem_retry_count: u32,
     /// Unix ts of the last redeem attempt (for backoff).
@@ -242,6 +466,8 @@ struct PersistedPosition {
     resolved_price: Option<String>,
     #[serde(default)]
     clob_fail_count: u32,
+    #[serde(default)]
+    sell_fail_count: u32,
     #[serde(default)]
     redeem_retry_count: u32,
     #[serde(default)]
@@ -282,6 +508,7 @@ impl PersistedPosition {
             status: p.status,
             resolved_price: p.resolved_price.map(|d| d.to_string()),
             clob_fail_count: p.clob_fail_count,
+            sell_fail_count: p.sell_fail_count,
             redeem_retry_count: p.redeem_retry_count,
             last_redeem_attempt: p.last_redeem_attempt,
             neg_risk: p.neg_risk,
@@ -309,6 +536,7 @@ impl PersistedPosition {
             status: self.status,
             resolved_price,
             clob_fail_count: self.clob_fail_count,
+            sell_fail_count: self.sell_fail_count,
             redeem_retry_count: self.redeem_retry_count,
             last_redeem_attempt: self.last_redeem_attempt,
             neg_risk: self.neg_risk,
@@ -1065,6 +1293,7 @@ fn promote_pending_to_active(
         status: PositionStatus::Active,
         resolved_price: None,
         clob_fail_count: 0,
+        sell_fail_count: 0,
         redeem_retry_count: 0,
         last_redeem_attempt: 0,
         neg_risk: None,
@@ -1283,6 +1512,9 @@ fn reconcile_positions(
                             onchain_dec
                         );
                         pos.size = onchain_dec;
+                        // Give the self-heal path a clean slate on the next
+                        // sell attempt: we just re-learned the true balance.
+                        pos.sell_fail_count = 0;
                     }
                 }
                 // Market has settled on-chain — mark for redeem instead of trying
@@ -1371,6 +1603,7 @@ fn reconcile_positions(
             status: PositionStatus::Active,
             resolved_price: None,
             clob_fail_count: 0,
+            sell_fail_count: 0,
             redeem_retry_count: 0,
             last_redeem_attempt: 0,
             neg_risk: None,
@@ -1380,6 +1613,76 @@ fn reconcile_positions(
     }
 
     reconciled
+}
+
+/// Result of a single `run_onchain_reconcile` attempt. `Completed` means the
+/// on-chain positions endpoint responded and we either applied the update or
+/// deliberately kept cache (empty-payload guard). `Skipped` covers
+/// no-wallet-configured or HTTP/parse failures — the caller should not
+/// advance `last_reconcile_ts` so the next tick will retry sooner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileOutcome {
+    Completed,
+    Skipped,
+}
+
+/// Run one pass of the on-chain reconcile against the current `open_positions`.
+///
+/// Extracted from the startup path so that:
+///   1. the main loop can re-run it on a timer (`PLAN_C_RECONCILE_INTERVAL_SECS`);
+///   2. any sell failure that can't be self-healed from the error payload can
+///      request a fresh reconcile immediately (see `handle_sell_failure`).
+///
+/// Matches the prior semantics precisely: if the on-chain endpoint returns
+/// zero positions while the cache still has Active ones, `keep_on_empty`
+/// decides whether we drop the cache (aggressive default) or hold it (safe
+/// override via `PLAN_C_RECONCILE_KEEP_ON_EMPTY`).
+async fn run_onchain_reconcile(
+    http: &reqwest::Client,
+    wallet: &str,
+    open_positions: &mut Vec<CopiedPosition>,
+    history_path: &Path,
+    keep_on_empty: bool,
+) -> ReconcileOutcome {
+    match fetch_onchain_positions(http, wallet).await {
+        Ok(onchain) => {
+            println!(
+                "plan_c: fetched {} on-chain position(s) for reconciliation",
+                onchain.len()
+            );
+            let cached_active = open_positions
+                .iter()
+                .filter(|p| matches!(p.status, PositionStatus::Active))
+                .count();
+            if onchain.is_empty() && cached_active > 0 && keep_on_empty {
+                eprintln!(
+                    "plan_c: on-chain returned 0 positions but cache has {} Active — keeping cache (PLAN_C_RECONCILE_KEEP_ON_EMPTY=true). If those positions really were settled manually, set the flag to false or edit the state file.",
+                    cached_active
+                );
+            } else {
+                if onchain.is_empty() && cached_active > 0 {
+                    eprintln!(
+                        "plan_c: WARNING — on-chain returned 0 positions while cache has {} Active. Dropping cache (default). Set PLAN_C_RECONCILE_KEEP_ON_EMPTY=true to override if this looks wrong.",
+                        cached_active
+                    );
+                }
+                let taken = std::mem::take(open_positions);
+                *open_positions = reconcile_positions(taken, &onchain, history_path);
+                println!(
+                    "plan_c: reconciled open_positions={} (of which {} are orphans with no trader metadata)",
+                    open_positions.len(),
+                    open_positions.iter().filter(|p| p.trader.is_empty()).count()
+                );
+            }
+            ReconcileOutcome::Completed
+        }
+        Err(e) => {
+            eprintln!(
+                "plan_c: on-chain reconciliation skipped (fetch failed after retries): {e} — proceeding with cached state only"
+            );
+            ReconcileOutcome::Skipped
+        }
+    }
 }
 
 fn short_token(token_id: &str) -> String {
@@ -1504,14 +1807,15 @@ async fn fetch_leaderboard_candidate_pool(
     Ok(pool)
 }
 
-async fn fetch_user_trades(
+async fn fetch_user_trades_offset(
     http: &reqwest::Client,
     user_address: &str,
     limit: u64,
+    offset: u64,
 ) -> anyhow::Result<Vec<TradeRecord>> {
     let url = format!(
-        "https://data-api.polymarket.com/trades?user={}&limit={}",
-        user_address, limit
+        "https://data-api.polymarket.com/trades?user={}&limit={}&offset={}",
+        user_address, limit, offset
     );
     let resp = http
         .get(&url)
@@ -1527,6 +1831,47 @@ async fn fetch_user_trades(
     }
     let trades: Vec<TradeRecord> = resp.json().await.context("trades parse failed")?;
     Ok(trades)
+}
+
+async fn fetch_user_trades(
+    http: &reqwest::Client,
+    user_address: &str,
+    limit: u64,
+) -> anyhow::Result<Vec<TradeRecord>> {
+    fetch_user_trades_offset(http, user_address, limit, 0).await
+}
+
+/// Paginate until a short page or empty. Data API allows up to 10k per request; used for
+/// `compute_persistence` after a candidate passes score gates (so long windows are not
+/// truncated to the discovery `limit=500` slice).
+async fn fetch_user_trades_all(
+    http: &reqwest::Client,
+    user_address: &str,
+) -> anyhow::Result<Vec<TradeRecord>> {
+    const PAGE: u64 = 10_000;
+    const MAX_ROWS: usize = 500_000;
+    let mut out: Vec<TradeRecord> = Vec::new();
+    let mut offset: u64 = 0;
+    loop {
+        let page = fetch_user_trades_offset(http, user_address, PAGE, offset).await?;
+        let n = page.len();
+        if n == 0 {
+            break;
+        }
+        out.extend(page);
+        if out.len() > MAX_ROWS {
+            eprintln!(
+                "plan_c: fetch_user_trades_all truncated at {} rows for {}",
+                MAX_ROWS, user_address
+            );
+            break;
+        }
+        if n < PAGE as usize {
+            break;
+        }
+        offset = offset.saturating_add(PAGE);
+    }
+    Ok(out)
 }
 
 fn stddev(values: &[f64]) -> f64 {
@@ -1743,6 +2088,28 @@ fn fifo_pnl_aggregate(trades: &[TradeRecord], count_cutoff: Option<i64>) -> Fifo
         pnl_by_condition,
         equity_events,
     }
+}
+
+/// Multi-window "sustained profit": every window must have net_realized > min_net and
+/// enough FIFO closes (see `fifo_pnl_aggregate` count_cutoff semantics).
+fn compute_persistence(
+    trades: &[TradeRecord],
+    windows_days: &[u64],
+    min_net: f64,
+    min_closes: usize,
+) -> (bool, Vec<(u64, f64)>) {
+    let now = Utc::now().timestamp();
+    let mut window_nets: Vec<(u64, f64)> = Vec::with_capacity(windows_days.len());
+    let mut all_ok = true;
+    for &days in windows_days {
+        let cutoff = now - (days as i64 * 86400);
+        let agg = fifo_pnl_aggregate(trades, Some(cutoff));
+        window_nets.push((days, agg.net_realized));
+        if !(agg.net_realized > min_net && agg.total >= min_closes) {
+            all_ok = false;
+        }
+    }
+    (all_ok, window_nets)
 }
 
 fn buy_notional_since(trades: &[TradeRecord], since_ts: i64, now_ts: i64) -> f64 {
@@ -2048,6 +2415,9 @@ async fn discover_qualified_traders(
     min_copy_score: f64,
     require_closed_trades: bool,
     min_closed_trades: usize,
+    persist_windows_days: Vec<u64>,
+    persist_min_net: f64,
+    persist_min_closes: usize,
     max_concurrency: usize,
 ) -> (Vec<QualifiedTrader>, Vec<String>) {
     let http_c = http.clone();
@@ -2104,6 +2474,9 @@ async fn discover_qualified_traders(
     for entry in entries {
         let http = http_c.clone();
         let sem = semaphore.clone();
+        let windows = persist_windows_days.clone();
+        let pmin = persist_min_net;
+        let pcl = persist_min_closes;
         futs.push(async move {
             let address = match entry.proxy_wallet {
                 Some(ref a) if !a.trim().is_empty() => a.trim().to_string(),
@@ -2235,8 +2608,16 @@ async fn discover_qualified_traders(
                 return None;
             }
 
+            let (persistent_profit, window_nets) =
+                compute_persistence(&trades, &windows, pmin, pcl);
+            let windows_fmt = window_nets
+                .iter()
+                .map(|(d, n)| format!("{}:{:.0}", d, n))
+                .collect::<Vec<_>>()
+                .join(" ");
+
             println!(
-                "plan_c: QUALIFIED {} (score={:.2} sharpe7d={:.2} wr_lcb={:.2} pf={:.2} rr={:.2} dd_pen={:.2} closed={} pnl={:.0} vol={:.0} trades={} avg={})",
+                "plan_c: QUALIFIED {} (score={:.2} sharpe7d={:.2} wr_lcb={:.2} pf={:.2} rr={:.2} dd_pen={:.2} closed={} pnl={:.0} vol={:.0} trades={} avg={} persist={} [{}])",
                 user_name,
                 score,
                 analysis.sharpe_7d,
@@ -2248,7 +2629,9 @@ async fn discover_qualified_traders(
                 pnl,
                 volume,
                 analysis.trade_count,
-                interval_display
+                interval_display,
+                persistent_profit,
+                windows_fmt
             );
 
             let roi = if volume > 0.0 { pnl / volume } else { 0.0 };
@@ -2267,17 +2650,29 @@ async fn discover_qualified_traders(
                 recent_roi: analysis.recent_roi,
                 max_drawdown: full.max_drawdown,
                 score,
+                persistent_profit,
+                window_nets,
             })
         });
     }
 
     let raw: Vec<Option<QualifiedTrader>> = join_all(futs).await;
     let mut candidates: Vec<QualifiedTrader> = raw.into_iter().flatten().collect();
-    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        b.persistent_profit
+            .cmp(&a.persistent_profit)
+            .then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
 
+    let persistent_count = candidates.iter().filter(|c| c.persistent_profit).count();
     println!(
-        "plan_c: discovery complete — qualified={} (parallel pool)",
-        candidates.len()
+        "plan_c: discovery complete — qualified={} persistent={} (sorted persistent-first, parallel pool)",
+        candidates.len(),
+        persistent_count
     );
 
     (candidates, top20_snapshot)
@@ -2344,6 +2739,21 @@ pub(crate) async fn run_plan_c_loop<C>(
     let min_leader_notional =
         read_f64_env_or(dotenv_path, "PLAN_C_MIN_LEADER_NOTIONAL", 100.0);
     let poll_secs = read_u64_env_or(dotenv_path, "PLAN_C_POLL_SECS", 30);
+
+    // "Solo‑leader" follow mode: after the normal discovery pipeline, pick a
+    // single leader that is persistently profitable and has the highest ROI
+    // (pnl / volume), then refresh that one leader's activity every
+    // `PLAN_C_SOLO_LEADER_POLL_SECS` seconds. All buy/sell signals strictly
+    // follow this single trader. Set `PLAN_C_SOLO_LEADER_MODE=true` to enable.
+    let solo_leader_mode =
+        crate::read_bool_env_or(dotenv_path, "PLAN_C_SOLO_LEADER_MODE", false);
+    let solo_leader_poll_secs =
+        read_u64_env_or(dotenv_path, "PLAN_C_SOLO_LEADER_POLL_SECS", 5).max(1);
+    let effective_poll_secs = if solo_leader_mode {
+        solo_leader_poll_secs
+    } else {
+        poll_secs
+    };
     let stop_loss_pct = read_decimal_env_or(
         dotenv_path,
         "PLAN_C_STOP_LOSS_PCT",
@@ -2380,6 +2790,46 @@ pub(crate) async fn run_plan_c_loop<C>(
     // market as closed/resolved so the position stops occupying a slot.
     let clob_fail_threshold =
         read_u64_env_or(dotenv_path, "PLAN_C_CLOB_FAIL_THRESHOLD", 5) as u32;
+    // After this many consecutive sell failures on the SAME position (where the
+    // exchange didn't give us a usable `balance:` number to self-heal from),
+    // force a fresh `fetch_onchain_positions` pass mid-run. Default 3 rounds.
+    // Set to 0 to disable auto-reconcile on failure.
+    let sell_fail_reconcile_after =
+        read_u64_env_or(dotenv_path, "PLAN_C_SELL_FAIL_RECONCILE_AFTER", 3) as u32;
+    // After this many consecutive sell failures (still no self-heal), drop the
+    // position from local state entirely. We give up rather than spam /order
+    // forever. Default 20 (at a 30s poll that's ~10 minutes). Set to 0 to
+    // disable — positions will retry indefinitely.
+    let sell_fail_drop_after =
+        read_u64_env_or(dotenv_path, "PLAN_C_SELL_FAIL_DROP_AFTER", 20) as u32;
+    // Re-run the on-chain reconcile every N seconds, regardless of activity.
+    // Catches silent drift (partial fills, manual exits, settlements) without
+    // waiting for a sell to fail first. Default 600s (10 min); 0 disables.
+    let reconcile_interval_secs =
+        read_u64_env_or(dotenv_path, "PLAN_C_RECONCILE_INTERVAL_SECS", 600) as i64;
+    // Smallest share amount the bot will try to sell. Matches the min_size used
+    // by `conservative_sell_size` (0.01). Positions whose authoritative balance
+    // is below this are dust the CLOB won't accept anyway — drop them instead
+    // of retrying forever.
+    let min_tradable_size: Decimal = Decimal::new(1, 2);
+
+    // Case-insensitive substring blocklist for market title / slug. Historically
+    // ~90% of esports-market copies ended in a loss (thin books, minute-scale
+    // settlements, leaders using promo liquidity rather than betting on
+    // outcome), so we hard-veto them at the copy-buy entry point.
+    //
+    //   PLAN_C_BLOCKED_KEYWORDS=<comma-separated>  — replace the default list
+    //                                                 (empty / unset => default)
+    //   PLAN_C_BLOCKED_KEYWORDS=__none__           — disable filtering entirely
+    let blocked_market_keywords: Vec<String> = parse_blocked_keywords_override(
+        resolve_runtime_var("PLAN_C_BLOCKED_KEYWORDS", dotenv_path),
+    )
+    .unwrap_or_else(|| {
+        DEFAULT_BLOCKED_MARKET_KEYWORDS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    });
     // On-chain redeem configuration (Phase 2).
     let auto_redeem = resolve_runtime_var("PLAN_C_AUTO_REDEEM", dotenv_path)
         .map(|v| {
@@ -2433,7 +2883,15 @@ pub(crate) async fn run_plan_c_loop<C>(
         "PLAN_C_BUY_SLIPPAGE",
         Decimal::from_str("0.02").unwrap_or(Decimal::ZERO),
     );
-    let max_per_trader = read_u64_env_or(dotenv_path, "PLAN_C_MAX_PER_TRADER", 2) as usize;
+    let max_per_trader_raw = read_u64_env_or(dotenv_path, "PLAN_C_MAX_PER_TRADER", 2) as usize;
+    // In solo‑leader mode we only track one leader; the 2‑per‑trader cap would
+    // otherwise prevent us from following them into more than two markets.
+    // Lift it to `max_positions` so the global slot budget is the real bottleneck.
+    let max_per_trader = if solo_leader_mode {
+        max_per_trader_raw.max(read_u64_env_or(dotenv_path, "PLAN_C_MAX_POSITIONS", 5) as usize)
+    } else {
+        max_per_trader_raw
+    };
     let refresh_leaders_secs = read_u64_env_or(dotenv_path, "PLAN_C_REFRESH_LEADERS_SECS", 1200);
     let exit_mode = parse_exit_mode(resolve_runtime_var("PLAN_C_EXIT_MODE", dotenv_path));
     let leader_sell_max_age_secs =
@@ -2452,6 +2910,31 @@ pub(crate) async fn run_plan_c_loop<C>(
     let min_closed_trades =
         read_u64_env_or(dotenv_path, "PLAN_C_MIN_CLOSED_TRADES", 10) as usize;
 
+    let mut persist_windows_days: Vec<u64> = resolve_runtime_var(
+        "PLAN_C_PERSIST_WINDOWS_DAYS",
+        dotenv_path,
+    )
+    .map(|raw| {
+        raw.split(',')
+            .filter_map(|s| {
+                let t = s.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    t.parse().ok()
+                }
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    if persist_windows_days.is_empty() {
+        persist_windows_days = vec![7, 30, 90];
+    }
+    let persist_min_net =
+        read_f64_env_or(dotenv_path, "PLAN_C_PERSIST_MIN_NET_PER_WINDOW", 0.0);
+    let persist_min_closes =
+        read_u64_env_or(dotenv_path, "PLAN_C_PERSIST_MIN_CLOSES_PER_WINDOW", 1) as usize;
+
     println!("plan_c: leaderboard_limit={leaderboard_limit} candidate_pool_max={candidate_pool_max} period={period} multi_lb={use_multi_leaderboard}");
     println!("plan_c: min_pnl={min_pnl} min_volume={min_volume} min_realized_pnl={min_realized_pnl} max_mkt_conc={max_market_concentration} max_unreal={max_unrealized_ratio}");
     println!("plan_c: analysis_hours={analysis_hours} min_avg_interval={min_avg_interval_secs}s max_trades_in_window={max_trades_in_window}");
@@ -2459,12 +2942,17 @@ pub(crate) async fn run_plan_c_loop<C>(
     println!("plan_c: recent_window_hours={recent_window_hours} max_trade_age_secs={max_trade_age_secs}");
     println!("plan_c: score_weights w_ret={w_ret} w_win_rate={w_wr} w_profit_factor={w_pf} w_recent_roi={w_rr} w_dd={w_dd}");
     println!(
-        "plan_c: order_usd base={} min={} max={} min_leader_notional={} poll_secs={}",
+        "plan_c: order_usd base={} min={} max={} min_leader_notional={} poll_secs={} (effective={})",
         order_usd_base,
         order_usd_min,
         order_usd_max,
         min_leader_notional,
-        poll_secs
+        poll_secs,
+        effective_poll_secs,
+    );
+    println!(
+        "plan_c: solo_leader_mode={} solo_leader_poll_secs={}",
+        solo_leader_mode, solo_leader_poll_secs
     );
     println!("plan_c: stop_loss={stop_loss_pct} take_profit={take_profit_pct} max_positions={max_positions}");
     println!("plan_c: buy_slippage={buy_slippage} max_per_trader={max_per_trader} refresh_leaders={refresh_leaders_secs}s");
@@ -2477,12 +2965,32 @@ pub(crate) async fn run_plan_c_loop<C>(
         min_copy_score, require_closed_trades, min_closed_trades
     );
     println!(
+        "plan_c: persist_windows={:?} persist_min_net={} persist_min_closes={}",
+        persist_windows_days, persist_min_net, persist_min_closes
+    );
+    println!(
         "plan_c: auto_redeem={} rpc_url={} redeem_max_retries={} redeem_backoff_secs={}",
         auto_redeem, rpc_url, redeem_max_retries, redeem_backoff_secs
     );
     println!(
         "plan_c: clob_fail_threshold={} (rounds before marking market Resolved)",
         clob_fail_threshold
+    );
+    println!(
+        "plan_c: sell_fail_reconcile_after={} sell_fail_drop_after={} reconcile_interval_secs={}",
+        sell_fail_reconcile_after, sell_fail_drop_after, reconcile_interval_secs
+    );
+    println!(
+        "plan_c: blocked_market_keywords ({}): {}",
+        blocked_market_keywords.len(),
+        if blocked_market_keywords
+            .iter()
+            .any(|k| k == "__none__")
+        {
+            "(filter disabled)".to_string()
+        } else {
+            blocked_market_keywords.join(", ")
+        }
     );
     println!(
         "plan_c: pending_timeout_secs={} (0 = disabled; otherwise auto-cancel unfilled buys after N seconds)",
@@ -2664,43 +3172,18 @@ pub(crate) async fn run_plan_c_loop<C>(
     // default (drop everything not confirmed on-chain).
     let reconcile_keep_on_empty =
         crate::read_bool_env_or(dotenv_path, "PLAN_C_RECONCILE_KEEP_ON_EMPTY", false);
+    let mut last_reconcile_ts: i64 = 0;
     if let Some(wallet) = proxy_wallet.as_deref() {
-        match fetch_onchain_positions(&http, wallet).await {
-            Ok(onchain) => {
-                println!(
-                    "plan_c: fetched {} on-chain position(s) for reconciliation",
-                    onchain.len()
-                );
-                let cached_active = open_positions
-                    .iter()
-                    .filter(|p| matches!(p.status, PositionStatus::Active))
-                    .count();
-                if onchain.is_empty() && cached_active > 0 && reconcile_keep_on_empty {
-                    eprintln!(
-                        "plan_c: on-chain returned 0 positions but cache has {} Active — keeping cache (PLAN_C_RECONCILE_KEEP_ON_EMPTY=true). If those positions really were settled manually, set the flag to false or edit the state file.",
-                        cached_active
-                    );
-                } else {
-                    if onchain.is_empty() && cached_active > 0 {
-                        eprintln!(
-                            "plan_c: WARNING — on-chain returned 0 positions while cache has {} Active. Dropping cache (default). Set PLAN_C_RECONCILE_KEEP_ON_EMPTY=true to override if this looks wrong.",
-                            cached_active
-                        );
-                    }
-                    open_positions =
-                        reconcile_positions(open_positions, &onchain, history_path);
-                    println!(
-                        "plan_c: reconciled open_positions={} (of which {} are orphans with no trader metadata)",
-                        open_positions.len(),
-                        open_positions.iter().filter(|p| p.trader.is_empty()).count()
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "plan_c: on-chain reconciliation skipped (fetch failed after retries): {e} — proceeding with cached state only"
-                );
-            }
+        let outcome = run_onchain_reconcile(
+            &http,
+            wallet,
+            &mut open_positions,
+            history_path,
+            reconcile_keep_on_empty,
+        )
+        .await;
+        if matches!(outcome, ReconcileOutcome::Completed) {
+            last_reconcile_ts = Utc::now().timestamp();
         }
     } else {
         eprintln!(
@@ -2810,6 +3293,9 @@ pub(crate) async fn run_plan_c_loop<C>(
                 min_copy_score,
                 require_closed_trades,
                 min_closed_trades,
+                persist_windows_days.clone(),
+                persist_min_net,
+                persist_min_closes,
                 analyze_concurrency,
             )
             .await;
@@ -2821,6 +3307,78 @@ pub(crate) async fn run_plan_c_loop<C>(
                 println!("plan_c: no qualified traders found, retrying in 5 minutes");
                 time::sleep(Duration::from_secs(300)).await;
                 continue;
+            }
+
+            // Solo‑leader narrowing: keep only the single best trader.
+            // Selection rule:
+            //   1. Prefer traders with persistent_profit = true (profitable in
+            //      every configured window — see `compute_persistence`).
+            //   2. Among those, pick the highest ROI (= pnl / volume on the
+            //      leaderboard period; this is the "盈利率" the operator asked for).
+            //   3. If no trader clears the persistent_profit bar, fall back to
+            //      highest ROI overall so we still have a leader to follow
+            //      instead of silently idling.
+            if solo_leader_mode {
+                let mut pool_persistent: Vec<QualifiedTrader> = qualified_traders
+                    .iter()
+                    .filter(|t| t.persistent_profit)
+                    .cloned()
+                    .collect();
+                let chosen = if !pool_persistent.is_empty() {
+                    pool_persistent.sort_by(|a, b| {
+                        b.roi
+                            .partial_cmp(&a.roi)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| {
+                                b.score
+                                    .partial_cmp(&a.score)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                    });
+                    pool_persistent.into_iter().next()
+                } else {
+                    let mut pool_all = qualified_traders.clone();
+                    pool_all.sort_by(|a, b| {
+                        b.roi
+                            .partial_cmp(&a.roi)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| {
+                                b.score
+                                    .partial_cmp(&a.score)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                    });
+                    if !pool_all.is_empty() {
+                        println!(
+                            "plan_c: SOLO_LEADER — no persistent_profit trader in pool of {}, falling back to highest ROI overall",
+                            pool_all.len()
+                        );
+                    }
+                    pool_all.into_iter().next()
+                };
+
+                match chosen {
+                    Some(pick) => {
+                        println!(
+                            "plan_c: SOLO_LEADER picked {} addr={} roi={:.4} pnl={:.0} vol={:.0} score={:.2} persistent={} — tracking every {}s",
+                            pick.user_name,
+                            pick.address,
+                            pick.roi,
+                            pick.pnl,
+                            pick.volume,
+                            pick.score,
+                            pick.persistent_profit,
+                            solo_leader_poll_secs,
+                        );
+                        qualified_traders = vec![pick];
+                    }
+                    None => {
+                        println!("plan_c: SOLO_LEADER — no candidate available this cycle, sleeping 5 minutes");
+                        qualified_traders.clear();
+                        time::sleep(Duration::from_secs(300)).await;
+                        continue;
+                    }
+                }
             }
         }
 
@@ -2896,6 +3454,10 @@ pub(crate) async fn run_plan_c_loop<C>(
         }
 
         let mut closed_indices = Vec::new();
+        // Set by `handle_sell_failure` when consecutive failures suggest the
+        // local size drifted from on-chain truth. We actually run the reconcile
+        // *after* the per-position loop to avoid mutating the vec mid-iteration.
+        let mut reconcile_requested = false;
         for (idx, pos) in open_positions.iter_mut().enumerate() {
             // Resolved / RedeemFailed positions are no longer tradable on CLOB;
             // they are handled by the redeem pipeline below (Phase 2).
@@ -2992,6 +3554,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                     match execution.submit(&signal).await {
                         Ok(report) => {
                             print_execution_report(&report);
+                            pos.sell_fail_count = 0;
                             let round_pnl = (current_bid - pos.entry_price) * sell_size;
                             daily_pnl += round_pnl;
                             append_round_record(
@@ -3024,9 +3587,21 @@ pub(crate) async fn run_plan_c_loop<C>(
                             // retries the exit. Historical bug: we used to drop the position
                             // here unconditionally, producing "ghost" positions that stayed
                             // on-chain but were invisible to the bot.
+                            let err_str = e.to_string();
                             eprintln!(
                                 "plan_c: sell (leader exit) failed — keeping position for retry: {e}"
                             );
+                            match handle_sell_failure(
+                                pos,
+                                &err_str,
+                                min_tradable_size,
+                                sell_fail_reconcile_after,
+                                sell_fail_drop_after,
+                            ) {
+                                SellFailAction::DropPosition => closed_indices.push(idx),
+                                SellFailAction::TriggerReconcile => reconcile_requested = true,
+                                SellFailAction::RetryNextRound => {}
+                            }
                         }
                     }
                     // Skip local SL/TP this round regardless of leader-exit outcome:
@@ -3067,6 +3642,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                 match execution.submit(&signal).await {
                     Ok(report) => {
                         print_execution_report(&report);
+                        pos.sell_fail_count = 0;
                         let round_pnl = (current_bid - pos.entry_price) * sell_size;
                         daily_pnl += round_pnl;
                         append_round_record(
@@ -3091,9 +3667,21 @@ pub(crate) async fn run_plan_c_loop<C>(
                     Err(e) => {
                         // Keep the position for a retry on the next poll instead
                         // of dropping it and leaving a ghost on-chain.
+                        let err_str = e.to_string();
                         eprintln!(
                             "plan_c: sell (stop loss) failed — keeping position for retry: {e}"
                         );
+                        match handle_sell_failure(
+                            pos,
+                            &err_str,
+                            min_tradable_size,
+                            sell_fail_reconcile_after,
+                            sell_fail_drop_after,
+                        ) {
+                            SellFailAction::DropPosition => closed_indices.push(idx),
+                            SellFailAction::TriggerReconcile => reconcile_requested = true,
+                            SellFailAction::RetryNextRound => {}
+                        }
                     }
                 }
             } else if local_safety_active && pnl_pct >= take_profit_pct {
@@ -3122,6 +3710,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                 match execution.submit(&signal).await {
                     Ok(report) => {
                         print_execution_report(&report);
+                        pos.sell_fail_count = 0;
                         let round_pnl = (current_bid - pos.entry_price) * sell_size;
                         daily_pnl += round_pnl;
                         append_round_record(
@@ -3146,9 +3735,21 @@ pub(crate) async fn run_plan_c_loop<C>(
                     Err(e) => {
                         // Keep the position for a retry on the next poll instead
                         // of dropping it and leaving a ghost on-chain.
+                        let err_str = e.to_string();
                         eprintln!(
                             "plan_c: sell (take profit) failed — keeping position for retry: {e}"
                         );
+                        match handle_sell_failure(
+                            pos,
+                            &err_str,
+                            min_tradable_size,
+                            sell_fail_reconcile_after,
+                            sell_fail_drop_after,
+                        ) {
+                            SellFailAction::DropPosition => closed_indices.push(idx),
+                            SellFailAction::TriggerReconcile => reconcile_requested = true,
+                            SellFailAction::RetryNextRound => {}
+                        }
                     }
                 }
             }
@@ -3167,6 +3768,58 @@ pub(crate) async fn run_plan_c_loop<C>(
                 daily_pnl,
                 &daily_pnl_date,
             );
+        }
+
+        // ------------------------------------------------------------------
+        // Mid-run on-chain reconcile.
+        // Triggers:
+        //   (a) periodic tick (`PLAN_C_RECONCILE_INTERVAL_SECS`), or
+        //   (b) a sell failure that exceeded `sell_fail_reconcile_after` and
+        //       whose error payload didn't include a parseable `balance:`
+        //       number we could self-heal from.
+        // Either way we re-fetch on-chain positions, clamp local sizes, drop
+        // positions that no longer exist on-chain, and adopt new orphans. The
+        // very next poll will then use the corrected sizes.
+        // ------------------------------------------------------------------
+        if let Some(wallet) = proxy_wallet.as_deref() {
+            let now_ts = Utc::now().timestamp();
+            let periodic_due = reconcile_interval_secs > 0
+                && (now_ts - last_reconcile_ts) >= reconcile_interval_secs;
+            if reconcile_requested || periodic_due {
+                let reason = if reconcile_requested {
+                    "sell-failure trigger"
+                } else {
+                    "periodic tick"
+                };
+                println!(
+                    "plan_c: mid-run reconcile starting (reason={}, last_ran={}s ago)",
+                    reason,
+                    if last_reconcile_ts > 0 {
+                        (now_ts - last_reconcile_ts).to_string()
+                    } else {
+                        "never".to_string()
+                    }
+                );
+                let outcome = run_onchain_reconcile(
+                    &http,
+                    wallet,
+                    &mut open_positions,
+                    history_path,
+                    reconcile_keep_on_empty,
+                )
+                .await;
+                if matches!(outcome, ReconcileOutcome::Completed) {
+                    last_reconcile_ts = now_ts;
+                    save_plan_c_state(
+                        state_path,
+                        &open_positions,
+                        &pending_buys,
+                        &last_seen_trades,
+                        daily_pnl,
+                        &daily_pnl_date,
+                    );
+                }
+            }
         }
 
         // ------------------------------------------------------------------
@@ -3563,6 +4216,29 @@ pub(crate) async fn run_plan_c_loop<C>(
                     continue;
                 }
 
+                // Category blocklist: refuse to copy markets that historically
+                // hemorrhage money (esports by default). Match before we do any
+                // network / sizing work so the veto is as cheap as possible.
+                // We still advance the watermark so the same trade isn't
+                // re-evaluated every poll — the market isn't going to
+                // un-become an esports match.
+                if is_blocked_market(
+                    trade.title.as_deref(),
+                    trade.slug.as_deref(),
+                    &blocked_market_keywords,
+                ) {
+                    let leader_name = trader.user_name.as_str();
+                    let market_title = trade.title.as_deref().unwrap_or(&market_id);
+                    println!(
+                        "plan_c: SKIP (blocked category) — trader={} market=\"{}\" slug=\"{}\"",
+                        leader_name,
+                        market_title,
+                        trade.slug.as_deref().unwrap_or(""),
+                    );
+                    mark_processed(&trader.address, trade_ts);
+                    continue;
+                }
+
                 let buy_price = (trade_price + buy_slippage).round_dp(2);
                 if buy_price >= Decimal::ONE || buy_price <= Decimal::ZERO {
                     mark_processed(&trader.address, trade_ts);
@@ -3742,6 +4418,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                                 status: PositionStatus::Active,
                                 resolved_price: None,
                                 clob_fail_count: 0,
+                                sell_fail_count: 0,
                                 redeem_retry_count: 0,
                                 last_redeem_attempt: 0,
                                 neg_risk: None,
@@ -3866,7 +4543,7 @@ pub(crate) async fn run_plan_c_loop<C>(
             .filter(|p| matches!(p.status, PositionStatus::RedeemFailed))
             .count();
         println!(
-            "[{}] plan_c: poll #{loop_idx} done — positions={}/{} pending={} resolved={} redeem_failed={} daily_pnl={} tracking={} traders — sleeping {}s",
+            "[{}] plan_c: poll #{loop_idx} done — positions={}/{} pending={} resolved={} redeem_failed={} daily_pnl={} tracking={} traders{} — sleeping {}s",
             chrono::Local::now().format("%m/%d %H:%M:%S"),
             active_cnt,
             max_positions,
@@ -3875,9 +4552,10 @@ pub(crate) async fn run_plan_c_loop<C>(
             redeem_failed_cnt,
             daily_pnl,
             qualified_traders.len(),
-            poll_secs
+            if solo_leader_mode { " [solo]" } else { "" },
+            effective_poll_secs
         );
-        time::sleep(Duration::from_secs(poll_secs)).await;
+        time::sleep(Duration::from_secs(effective_poll_secs)).await;
     }
 }
 
@@ -4022,5 +4700,198 @@ mod plan_c_algorithm_tests {
         assert!((a.gross_profit - 5.0).abs() < 1e-6, "gp={}", a.gross_profit);
         assert!(a.gross_loss.abs() < 1e-6);
         assert_eq!(a.wins, 1);
+    }
+
+    fn sample_pos() -> CopiedPosition {
+        CopiedPosition {
+            trader: String::new(),
+            market_id: "0xabc".to_string(),
+            token_id: "t".to_string(),
+            side: Side::Yes,
+            entry_price: Decimal::new(5, 1), // 0.5
+            size: Decimal::new(1836, 4),     // 0.1836
+            opened_at: 0,
+            leader_buy_ts: 0,
+            status: PositionStatus::Active,
+            resolved_price: None,
+            clob_fail_count: 0,
+            sell_fail_count: 0,
+            redeem_retry_count: 0,
+            last_redeem_attempt: 0,
+            neg_risk: None,
+            market_title: String::new(),
+            trader_name: "orphan".to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_balance_from_error_extracts_shares() {
+        // Exact payload shape observed in production logs.
+        let body = r#"Status: error(400 Bad Request) making POST call to /order with {"error":"not enough balance / allowance: the balance is not enough -> balance: 3600, order amount: 170000"}"#;
+        let b = parse_balance_from_error(body).expect("balance should parse");
+        assert_eq!(b, Decimal::new(36, 4)); // 3600 raw / 1e6 = 0.0036
+    }
+
+    #[test]
+    fn parse_balance_from_error_handles_absence() {
+        assert!(parse_balance_from_error("connection reset").is_none());
+        assert!(parse_balance_from_error("balance:").is_none(), "empty value");
+        assert!(parse_balance_from_error("balance: abc").is_none(), "non-digit");
+    }
+
+    #[test]
+    fn handle_sell_failure_self_heals_and_drops_dust() {
+        // Exact scenario from the production log: pos.size=0.1836 but on-chain
+        // balance is 0.0036. After we parse the error and re-sync, the remainder
+        // is below the min tradable size (0.01), so the position should be dropped.
+        let mut pos = sample_pos();
+        let err = r#"{"error":"balance: 3600, order amount: 170000"}"#;
+        let action = handle_sell_failure(&mut pos, err, Decimal::new(1, 2), 3, 20);
+        assert_eq!(action, SellFailAction::DropPosition);
+        assert_eq!(pos.size, Decimal::new(36, 4));
+    }
+
+    #[test]
+    fn handle_sell_failure_self_heals_and_retries_when_tradable() {
+        // on-chain 0.05 > min 0.01 → resize + retry, and the stall counter
+        // must reset because we made actionable progress.
+        let mut pos = sample_pos();
+        pos.sell_fail_count = 7;
+        let err = r#"{"error":"balance: 50000, order amount: 170000"}"#;
+        let action = handle_sell_failure(&mut pos, err, Decimal::new(1, 2), 3, 20);
+        assert_eq!(action, SellFailAction::RetryNextRound);
+        assert_eq!(pos.size, Decimal::new(5, 2));
+        assert_eq!(pos.sell_fail_count, 0);
+    }
+
+    #[test]
+    fn handle_sell_failure_unparseable_escalates_to_reconcile_then_drops() {
+        // Opaque (non-balance) errors should NOT touch pos.size. After
+        // `reconcile_after` hits we ask for a reconcile; after `drop_after`
+        // hits we give up.
+        let mut pos = sample_pos();
+        let opaque = "connection reset by peer";
+
+        // First two failures: just retry.
+        assert_eq!(
+            handle_sell_failure(&mut pos, opaque, Decimal::new(1, 2), 3, 5),
+            SellFailAction::RetryNextRound
+        );
+        assert_eq!(pos.sell_fail_count, 1);
+        assert_eq!(pos.size, Decimal::new(1836, 4), "size unchanged on opaque err");
+
+        assert_eq!(
+            handle_sell_failure(&mut pos, opaque, Decimal::new(1, 2), 3, 5),
+            SellFailAction::RetryNextRound
+        );
+
+        // Third failure crosses reconcile_after=3.
+        assert_eq!(
+            handle_sell_failure(&mut pos, opaque, Decimal::new(1, 2), 3, 5),
+            SellFailAction::TriggerReconcile
+        );
+
+        // Fourth still asks for reconcile (we haven't rebooted the counter).
+        assert_eq!(
+            handle_sell_failure(&mut pos, opaque, Decimal::new(1, 2), 3, 5),
+            SellFailAction::TriggerReconcile
+        );
+
+        // Fifth crosses drop_after=5.
+        assert_eq!(
+            handle_sell_failure(&mut pos, opaque, Decimal::new(1, 2), 3, 5),
+            SellFailAction::DropPosition
+        );
+    }
+
+    #[test]
+    fn blocked_keywords_match_esports_titles() {
+        let bl: Vec<String> = DEFAULT_BLOCKED_MARKET_KEYWORDS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Exact titles observed in plan_c_state.json.
+        assert!(is_blocked_market(
+            Some("LoL: Weibo Gaming vs JD Gaming (BO3) - LPL Group Ascend"),
+            None,
+            &bl
+        ));
+        assert!(is_blocked_market(
+            Some("CS2: Natus Vincere vs Team Spirit - BLAST Premier"),
+            None,
+            &bl
+        ));
+        assert!(is_blocked_market(Some("Dota 2: Tundra vs OG"), None, &bl));
+        assert!(is_blocked_market(Some("VALORANT Champions: PRX vs SEN"), None, &bl));
+        // Slug-only fallback (rare but possible).
+        assert!(is_blocked_market(None, Some("lol-worlds-2026-winner"), &bl));
+    }
+
+    #[test]
+    fn blocked_keywords_leave_non_esports_alone() {
+        let bl: Vec<String> = DEFAULT_BLOCKED_MARKET_KEYWORDS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Real-world political / sports / crypto titles from other state entries.
+        assert!(!is_blocked_market(
+            Some("US obtains Iranian enriched uranium by May 31?"),
+            None,
+            &bl
+        ));
+        assert!(!is_blocked_market(
+            Some("Will SV Werder Bremen win on 2026-04-18?"),
+            None,
+            &bl
+        ));
+        assert!(!is_blocked_market(
+            Some("Will Sandefjord Fotball win on 2026-04-18?"),
+            None,
+            &bl
+        ));
+        // "LOL" substring inside an unrelated word must NOT trip the filter
+        // because our keywords anchor with punctuation / spaces.
+        assert!(!is_blocked_market(Some("Lola wins Best Picture?"), None, &bl));
+        // Missing metadata — don't block by default.
+        assert!(!is_blocked_market(None, None, &bl));
+    }
+
+    #[test]
+    fn blocked_keywords_disabled_via_sentinel() {
+        let bl = vec!["__none__".to_string()];
+        assert!(!is_blocked_market(
+            Some("LoL: anything goes"),
+            Some("lol-foo"),
+            &bl
+        ));
+    }
+
+    #[test]
+    fn parse_blocked_keywords_override_handles_disable_and_empty() {
+        // Explicit disable sentinel passes through.
+        let v = parse_blocked_keywords_override(Some("__none__".to_string())).unwrap();
+        assert_eq!(v, vec!["__none__".to_string()]);
+
+        // Blank string / only-commas → None (caller should fall back to default).
+        assert!(parse_blocked_keywords_override(Some("".to_string())).is_none());
+        assert!(parse_blocked_keywords_override(Some(",,  ,".to_string())).is_none());
+
+        // Mixed case + whitespace is normalised.
+        let v = parse_blocked_keywords_override(Some("  LoL:, Dota , CS2".to_string())).unwrap();
+        assert_eq!(v, vec!["lol:".to_string(), "dota".to_string(), "cs2".to_string()]);
+    }
+
+    #[test]
+    fn handle_sell_failure_respects_disabled_thresholds() {
+        // reconcile_after=0 and drop_after=0 means "never escalate" — used by
+        // ops who want pure retry semantics.
+        let mut pos = sample_pos();
+        for _ in 0..50 {
+            assert_eq!(
+                handle_sell_failure(&mut pos, "opaque", Decimal::new(1, 2), 0, 0),
+                SellFailAction::RetryNextRound
+            );
+        }
+        assert_eq!(pos.sell_fail_count, 50);
     }
 }
