@@ -61,6 +61,10 @@ pub(crate) async fn fetch_clob_best_bid(token_id: &str) -> anyhow::Result<Decima
     fetch_clob_price(token_id, "sell").await
 }
 
+pub(crate) async fn fetch_clob_best_ask(token_id: &str) -> anyhow::Result<Decimal> {
+    fetch_clob_price(token_id, "buy").await
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TokenPrices {
     pub(crate) best_ask: Decimal,

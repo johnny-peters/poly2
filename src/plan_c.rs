@@ -12,8 +12,8 @@ use tokio::time::{self, Duration};
 use poly2::{ExecutionClient, ExecutionStatus, RiskEngine, Side, StrategyContext, StrategyId};
 
 use crate::{
-    append_round_record, fetch_clob_best_bid, print_execution_report, read_decimal_env_or,
-    read_f64_env_or, read_u64_env_or, resolve_runtime_var,
+    append_round_record, fetch_clob_best_ask, fetch_clob_best_bid, print_execution_report,
+    read_decimal_env_or, read_f64_env_or, read_u64_env_or, resolve_runtime_var,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,33 @@ fn parse_exit_mode(raw: Option<String>) -> ExitMode {
 
 fn mode_has_local_safety(mode: ExitMode) -> bool {
     matches!(mode, ExitMode::LeaderWithSafety | ExitMode::LocalOnly)
+}
+
+/// When `USER_ADDRESSES` is set in `.env` or process env, Plan C skips leaderboard discovery
+/// and follows only these addresses. Supports single value, comma-separated list, or JSON array.
+fn parse_user_addresses(dotenv_path: &Path) -> Vec<String> {
+    let raw = match crate::resolve_runtime_var("USER_ADDRESSES", dotenv_path) {
+        Some(v) => v.trim().to_string(),
+        None => return Vec::new(),
+    };
+    if raw.is_empty() {
+        return Vec::new();
+    }
+
+    let tokens: Vec<String> = if raw.starts_with('[') {
+        serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+    } else {
+        raw.split(',').map(|s| s.to_string()).collect()
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    for t in tokens {
+        let a = t.trim().trim_matches('"').to_ascii_lowercase();
+        if a.starts_with("0x") && a.len() == 42 && !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out
 }
 
 fn mode_has_leader_exit(mode: ExitMode) -> bool {
@@ -360,6 +387,11 @@ struct QualifiedTrader {
     persistent_profit: bool,
     /// Per-window net realized (diagnostic / logging), same order as `PLAN_C_PERSIST_WINDOWS_DAYS`.
     window_nets: Vec<(u64, f64)>,
+    /// Per-`condition_id` FIFO-realized PnL (cloned from the trader-level aggregate).
+    /// Used at pending-signal sort time to prefer markets where this leader has
+    /// historically been profitable, so the `MAX_PER_TRADER` cap picks their
+    /// best-track-record markets first rather than first-come-first-served.
+    pnl_by_condition: HashMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1460,6 +1492,32 @@ async fn fetch_onchain_positions(
     Err(last_err.unwrap_or_else(|| anyhow!("fetch_onchain_positions: exhausted retries")))
 }
 
+/// Count a leader's on-chain "open" positions, the way the Polymarket UI
+/// surfaces them: entries with meaningful size, a live current price, and not
+/// already awaiting redeem. Used by plan-c's scan-mode hard gate
+/// (`PLAN_C_MIN_ACTIVE_POSITIONS`) to skip traders with only one active bet or
+/// whose entire book is already resolved/redeemable.
+///
+/// Intentionally distinct from "any position in the positions payload": a
+/// trader whose 5 positions all have `curPrice == 0 && redeemable == true`
+/// is effectively idle, and we don't want to copy them.
+async fn count_active_open_positions(
+    http: &reqwest::Client,
+    wallet: &str,
+) -> anyhow::Result<usize> {
+    let positions = fetch_onchain_positions_once(http, wallet).await?;
+    let n = positions
+        .iter()
+        .filter(|p| {
+            let size_ok = p.size.unwrap_or(0.0) > 0.01;
+            let cur_ok = p.cur_price.unwrap_or(0.0) > 0.0;
+            let not_redeemable = !matches!(p.redeemable, Some(true));
+            size_ok && cur_ok && not_redeemable
+        })
+        .count();
+    Ok(n)
+}
+
 fn f64_to_decimal(v: f64) -> Option<Decimal> {
     // Use a string formatted to a fixed precision to avoid scientific notation
     // and to tolerate floating-point noise. `normalize()` strips insignificant
@@ -2190,6 +2248,7 @@ fn compute_score_v2(
         - w_dd * dd_penalty.clamp(0.0, 1.0)
 }
 
+#[allow(dead_code)]
 fn max_single_market_concentration(agg: &FifoPnlAgg) -> f64 {
     let den = agg.net_realized.abs().max(1.0);
     agg.pnl_by_condition
@@ -2360,6 +2419,7 @@ fn analyze_trader_full(
     }
 }
 
+#[allow(dead_code)]
 async fn fetch_positions_unrealized_share(
     http: &reqwest::Client,
     wallet: &str,
@@ -2393,9 +2453,11 @@ async fn discover_qualified_traders(
     period: &str,
     min_pnl: f64,
     min_volume: f64,
-    min_realized_pnl: f64,
-    max_market_concentration: f64,
-    max_unrealized_ratio: f64,
+    min_active_positions: usize,
+    min_address_usdc: f64,
+    min_win_rate: f64,
+    rpc_urls: Vec<String>,
+    usdc_address: String,
     analysis_hours: u64,
     min_avg_interval_secs: f64,
     max_trades_in_window: usize,
@@ -2412,8 +2474,6 @@ async fn discover_qualified_traders(
     w_pf: f64,
     w_rr: f64,
     w_dd: f64,
-    min_copy_score: f64,
-    require_closed_trades: bool,
     min_closed_trades: usize,
     persist_windows_days: Vec<u64>,
     persist_min_net: f64,
@@ -2462,12 +2522,16 @@ async fn discover_qualified_traders(
         "single_period"
     };
     println!(
-        "plan_c: leaderboard returned {} entries (mode={} period={} min_pnl={} min_vol={})",
+        "plan_c: leaderboard returned {} entries (mode={} period={} min_pnl={} min_vol={} min_active_positions={} min_address_usdc={} min_win_rate={:.2} min_closed={})",
         entries.len(),
         mode,
         period,
         min_pnl,
-        min_volume
+        min_volume,
+        min_active_positions,
+        min_address_usdc,
+        min_win_rate,
+        min_closed_trades,
     );
 
     let mut futs = Vec::new();
@@ -2477,6 +2541,8 @@ async fn discover_qualified_traders(
         let windows = persist_windows_days.clone();
         let pmin = persist_min_net;
         let pcl = persist_min_closes;
+        let rpc_urls_local = rpc_urls.clone();
+        let usdc_addr_local = usdc_address.clone();
         futs.push(async move {
             let address = match entry.proxy_wallet {
                 Some(ref a) if !a.trim().is_empty() => a.trim().to_string(),
@@ -2497,11 +2563,75 @@ async fn discover_qualified_traders(
 
             // Hold the permit for the remainder of this trader's HTTP work;
             // release automatically on drop when this future resolves. This
-            // caps simultaneous trades-API + positions-API calls.
+            // caps simultaneous trades-API + positions-API + RPC balance calls.
             let _permit = match sem.acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => return None,
             };
+
+            // Scan-mode hard gate #1: on-chain active open positions.
+            // Shortcircuits before we pay for `fetch_user_trades` so accounts
+            // with only one bet (or all resolved/redeemable) are dropped fast.
+            let active_open = match count_active_open_positions(&http, &address).await {
+                Ok(n) => n,
+                Err(err) => {
+                    println!(
+                        "plan_c: FILTERED (active_open fetch failed) {} err={}",
+                        user_name, err
+                    );
+                    return None;
+                }
+            };
+            if active_open < min_active_positions {
+                println!(
+                    "plan_c: FILTERED (active_open) {} active_open={} < {}",
+                    user_name, active_open, min_active_positions
+                );
+                return None;
+            }
+
+            // Scan-mode hard gate #2: on-chain USDC balance across fallback RPCs.
+            // Any RPC failure across all providers is treated as "not qualified"
+            // — we'd rather drop a candidate than copy-trade a ghost wallet.
+            let rpc_refs: Vec<&str> =
+                rpc_urls_local.iter().map(|s| s.as_str()).collect();
+            let balance = if rpc_refs.is_empty() {
+                println!(
+                    "plan_c: FILTERED (no RPC URLs configured) {} cannot check address balance",
+                    user_name
+                );
+                return None;
+            } else {
+                match poly2::fetch_usdc_balance_multi(
+                    &rpc_refs,
+                    &usdc_addr_local,
+                    &address,
+                )
+                .await
+                {
+                    Ok(b) => b,
+                    Err(err) => {
+                        println!(
+                            "plan_c: FILTERED (balance fetch failed) {} across {} rpc(s): {}",
+                            user_name,
+                            rpc_refs.len(),
+                            err
+                        );
+                        return None;
+                    }
+                }
+            };
+            let balance_f64 = balance
+                .to_string()
+                .parse::<f64>()
+                .unwrap_or(0.0);
+            if balance_f64 < min_address_usdc {
+                println!(
+                    "plan_c: FILTERED (balance) {} wallet_usdc={:.0} < {:.0}",
+                    user_name, balance_f64, min_address_usdc
+                );
+                return None;
+            }
 
             let trades = match fetch_user_trades(&http, &address, 500).await {
                 Ok(t) => t,
@@ -2511,31 +2641,26 @@ async fn discover_qualified_traders(
                 }
             };
 
+            // Compute FIFO aggregates for both the win-rate gate and for
+            // downstream scoring/logging. We no longer gate on net_realized /
+            // concentration / unrealized ratio — those were "add_keep_bot"
+            // casualties per the scan-mode redesign.
             let full = fifo_pnl_aggregate(&trades, None);
-            if full.net_realized < min_realized_pnl {
-                println!(
-                    "plan_c: FILTERED (low realized FIFO net) {} net={:.0} < {:.0}",
-                    user_name, full.net_realized, min_realized_pnl
-                );
-                return None;
-            }
-            let conc = max_single_market_concentration(&full);
-            if conc > max_market_concentration {
-                println!(
-                    "plan_c: FILTERED (market concentration) {} max_cid_share={:.2} > {:.2}",
-                    user_name, conc, max_market_concentration
-                );
-                return None;
-            }
+            let win_rate_raw = if full.total > 0 {
+                full.wins as f64 / full.total as f64
+            } else {
+                0.0
+            };
 
-            if let Ok(Some(share)) = fetch_positions_unrealized_share(&http, &address).await {
-                if share > max_unrealized_ratio {
-                    println!(
-                        "plan_c: FILTERED (unrealized share) {} share={:.2} > {:.2}",
-                        user_name, share, max_unrealized_ratio
-                    );
-                    return None;
-                }
+            // Scan-mode hard gate #3: FIFO raw win rate with a minimum-sample
+            // floor. `min_closed_trades` is reused here as the "statistical
+            // significance" guard so `1/1 = 100%` can't slip through.
+            if full.total < min_closed_trades || win_rate_raw < min_win_rate {
+                println!(
+                    "plan_c: FILTERED (win_rate) {} win_rate={:.2} closed={} (need wr>={:.2} and closed>={})",
+                    user_name, win_rate_raw, full.total, min_win_rate, min_closed_trades
+                );
+                return None;
             }
 
             let analysis = analyze_trader_full(
@@ -2588,25 +2713,10 @@ async fn discover_qualified_traders(
                 format!("{:.0}s", analysis.avg_interval_secs)
             };
 
-            if require_closed_trades && analysis.closed_trade_count < min_closed_trades {
-                println!(
-                    "plan_c: FILTERED (insufficient stats) {} (score={:.2} closed={} < {})",
-                    user_name, score, analysis.closed_trade_count, min_closed_trades
-                );
-                return None;
-            }
-            if score < min_copy_score {
-                println!(
-                    "plan_c: FILTERED (low score) {} score={:.2} < {:.2} wr_lcb={:.2} pf={:.2} rr={:.2}",
-                    user_name,
-                    score,
-                    min_copy_score,
-                    analysis.wilson_wr_lcb,
-                    analysis.profit_factor,
-                    analysis.recent_roi,
-                );
-                return None;
-            }
+            // Scan-mode redesign: `min_copy_score` and `require_closed_trades`
+            // are no longer hard gates. The 5 user-facing rules (pnl, active
+            // positions, address USDC, win_rate, volume) + bot filter already
+            // decided acceptance above. `score` is kept purely for ranking/logs.
 
             let (persistent_profit, window_nets) =
                 compute_persistence(&trades, &windows, pmin, pcl);
@@ -2652,6 +2762,7 @@ async fn discover_qualified_traders(
                 score,
                 persistent_profit,
                 window_nets,
+                pnl_by_condition: full.pnl_by_condition.clone(),
             })
         });
     }
@@ -2690,12 +2801,22 @@ pub(crate) async fn run_plan_c_loop<C>(
     let period_raw = resolve_runtime_var("PLAN_C_LEADERBOARD_PERIOD", dotenv_path)
         .unwrap_or_else(|| "weekly".to_string());
     let period = period_raw.trim().to_string();
-    let min_pnl = read_f64_env_or(dotenv_path, "PLAN_C_MIN_PNL", 2000.0);
-    let min_volume = read_f64_env_or(dotenv_path, "PLAN_C_MIN_VOLUME", 50000.0);
-    let min_realized_pnl = read_f64_env_or(dotenv_path, "PLAN_C_MIN_REALIZED_PNL", 500.0);
-    let max_market_concentration =
-        read_f64_env_or(dotenv_path, "PLAN_C_MAX_MARKET_CONCENTRATION", 0.60);
-    let max_unrealized_ratio = read_f64_env_or(dotenv_path, "PLAN_C_MAX_UNREALIZED_RATIO", 0.70);
+    let min_pnl = read_f64_env_or(dotenv_path, "PLAN_C_MIN_PNL", 20000.0);
+    let min_volume = read_f64_env_or(dotenv_path, "PLAN_C_MIN_VOLUME", 0.0);
+    // Scan-mode hard gates introduced when the old FIFO / concentration /
+    // unrealized / score / closed-trade gates were dropped. See
+    // `docs/how2select_trader.md` for the current rule set.
+    let min_active_positions =
+        read_u64_env_or(dotenv_path, "PLAN_C_MIN_ACTIVE_POSITIONS", 2) as usize;
+    let min_address_usdc =
+        read_f64_env_or(dotenv_path, "PLAN_C_MIN_ADDRESS_USDC", 20000.0);
+    let min_win_rate = read_f64_env_or(dotenv_path, "PLAN_C_MIN_WIN_RATE", 0.80);
+    // Legacy env vars retained purely to avoid "missing key" surprises in
+    // existing `.env` files; they are no longer used as filter gates.
+    let _min_realized_pnl = read_f64_env_or(dotenv_path, "PLAN_C_MIN_REALIZED_PNL", 0.0);
+    let _max_market_concentration =
+        read_f64_env_or(dotenv_path, "PLAN_C_MAX_MARKET_CONCENTRATION", 1.0);
+    let _max_unrealized_ratio = read_f64_env_or(dotenv_path, "PLAN_C_MAX_UNREALIZED_RATIO", 1.0);
     let use_multi_leaderboard =
         crate::read_bool_env_or(dotenv_path, "PLAN_C_USE_MULTI_LEADERBOARD", true);
     let candidate_pool_max = read_u64_env_or(dotenv_path, "PLAN_C_CANDIDATE_POOL_MAX", 120) as usize;
@@ -2740,13 +2861,23 @@ pub(crate) async fn run_plan_c_loop<C>(
         read_f64_env_or(dotenv_path, "PLAN_C_MIN_LEADER_NOTIONAL", 100.0);
     let poll_secs = read_u64_env_or(dotenv_path, "PLAN_C_POLL_SECS", 30);
 
+    let user_addresses = parse_user_addresses(dotenv_path);
+    let manual_leader_mode = !user_addresses.is_empty();
+    if manual_leader_mode {
+        println!(
+            "plan_c: USER_ADDRESSES set ({}) — bypassing leaderboard discovery & SOLO_LEADER",
+            user_addresses.len()
+        );
+    }
+
     // "Solo‑leader" follow mode: after the normal discovery pipeline, pick a
     // single leader that is persistently profitable and has the highest ROI
     // (pnl / volume), then refresh that one leader's activity every
     // `PLAN_C_SOLO_LEADER_POLL_SECS` seconds. All buy/sell signals strictly
     // follow this single trader. Set `PLAN_C_SOLO_LEADER_MODE=true` to enable.
-    let solo_leader_mode =
-        crate::read_bool_env_or(dotenv_path, "PLAN_C_SOLO_LEADER_MODE", false);
+    // Disabled when `USER_ADDRESSES` is set (manual leader list).
+    let solo_leader_mode = crate::read_bool_env_or(dotenv_path, "PLAN_C_SOLO_LEADER_MODE", false)
+        && !manual_leader_mode;
     let solo_leader_poll_secs =
         read_u64_env_or(dotenv_path, "PLAN_C_SOLO_LEADER_POLL_SECS", 5).max(1);
     let effective_poll_secs = if solo_leader_mode {
@@ -2897,16 +3028,43 @@ pub(crate) async fn run_plan_c_loop<C>(
     let leader_sell_max_age_secs =
         read_u64_env_or(dotenv_path, "PLAN_C_LEADER_SELL_MAX_AGE_SECS", 300) as i64;
 
-    // Quality gates layered on top of the bot-filter: (方案 3)
-    //   * PLAN_C_MIN_COPY_SCORE     — hard floor on composite score (default 0.35)
-    //   * PLAN_C_REQUIRE_CLOSED_TRADES — require some FIFO-closed history (default true)
-    //   * PLAN_C_MIN_CLOSED_TRADES  — how many closed pairs are "some" (default 3)
-    // Previously score was only used for priority sorting, so any non-bot
-    // account with a stale fresh BUY could grab a slot regardless of how
-    // meaningless its wr/pf/recent_roi were.
-    let min_copy_score = read_f64_env_or(dotenv_path, "PLAN_C_MIN_COPY_SCORE", 0.45);
-    let require_closed_trades =
-        crate::read_bool_env_or(dotenv_path, "PLAN_C_REQUIRE_CLOSED_TRADES", true);
+    // Per-market affinity: when a leader has multiple fresh BUY signals in the same
+    // round, `MAX_PER_TRADER` used to be purely first-come-first-served on timestamp.
+    // With `PLAN_C_MARKET_AFFINITY_WEIGHT > 0`, ties on trader score break by the
+    // leader's historical FIFO realized PnL in that specific `condition_id`. A cid
+    // the leader has previously made money in outranks an unknown/losing cid within
+    // the same trader's pending batch, so the 2-per-trader cap now fills their
+    // "best-track-record" markets first. Set to 0 to disable and revert to FCFS.
+    let market_affinity_weight =
+        read_f64_env_or(dotenv_path, "PLAN_C_MARKET_AFFINITY_WEIGHT", 1.0);
+
+    // Copy-fidelity pre-check: at execution time, confirm the current CLOB top of
+    // book is still close enough to the leader's entry that we can realistically
+    // profit after paying a premium to catch up.
+    //   * `PLAN_C_MAX_COST_PREMIUM` (default 0.03) — reject if best_ask exceeds the
+    //     leader's entry price by more than this many cents (absolute).
+    //     Set >= 1.0 to disable.
+    //   * `PLAN_C_MIN_EDGE_RETENTION` (default 0.70) — require our projected
+    //     upside `(1 - effective_cost)` to retain at least this fraction of the
+    //     leader's upside `(1 - leader_price)`; assumes the market resolves YES.
+    //     Set <= 0.0 to disable.
+    // When the CLOB price fetch itself fails we allow the copy buy to proceed
+    // (don't introduce a new failure mode on top of network flakiness).
+    let max_cost_premium = read_decimal_env_or(
+        dotenv_path,
+        "PLAN_C_MAX_COST_PREMIUM",
+        Decimal::from_str("0.03").unwrap_or(Decimal::ZERO),
+    );
+    let min_edge_retention = read_f64_env_or(dotenv_path, "PLAN_C_MIN_EDGE_RETENTION", 0.70);
+
+    // Legacy quality gates — no longer used as filter gates, kept purely so
+    // existing `.env` files with these keys don't surprise operators. The
+    // composite `score` is still computed for logging + secondary sort.
+    let _min_copy_score = read_f64_env_or(dotenv_path, "PLAN_C_MIN_COPY_SCORE", 0.0);
+    let _require_closed_trades =
+        crate::read_bool_env_or(dotenv_path, "PLAN_C_REQUIRE_CLOSED_TRADES", false);
+    // `min_closed_trades` IS still used — re-purposed as the minimum-sample
+    // guard for the FIFO raw win-rate gate (prevents 1/1 = 100% slipping in).
     let min_closed_trades =
         read_u64_env_or(dotenv_path, "PLAN_C_MIN_CLOSED_TRADES", 10) as usize;
 
@@ -2936,7 +3094,15 @@ pub(crate) async fn run_plan_c_loop<C>(
         read_u64_env_or(dotenv_path, "PLAN_C_PERSIST_MIN_CLOSES_PER_WINDOW", 1) as usize;
 
     println!("plan_c: leaderboard_limit={leaderboard_limit} candidate_pool_max={candidate_pool_max} period={period} multi_lb={use_multi_leaderboard}");
-    println!("plan_c: min_pnl={min_pnl} min_volume={min_volume} min_realized_pnl={min_realized_pnl} max_mkt_conc={max_market_concentration} max_unreal={max_unrealized_ratio}");
+    println!(
+        "plan_c: scan_mode_gates min_pnl={} min_volume={} min_active_positions={} min_address_usdc={} min_win_rate={:.2} min_closed_trades={}",
+        min_pnl,
+        min_volume,
+        min_active_positions,
+        min_address_usdc,
+        min_win_rate,
+        min_closed_trades,
+    );
     println!("plan_c: analysis_hours={analysis_hours} min_avg_interval={min_avg_interval_secs}s max_trades_in_window={max_trades_in_window}");
     println!("plan_c: bot_filters min_interval_stddev={min_interval_stddev} max_active_hour_ratio={max_active_hour_ratio} max_ncv={max_notional_cv} min_div={min_market_diversity} max_p99p50={max_size_p99_p50}");
     println!("plan_c: recent_window_hours={recent_window_hours} max_trade_age_secs={max_trade_age_secs}");
@@ -2957,12 +3123,14 @@ pub(crate) async fn run_plan_c_loop<C>(
     println!("plan_c: stop_loss={stop_loss_pct} take_profit={take_profit_pct} max_positions={max_positions}");
     println!("plan_c: buy_slippage={buy_slippage} max_per_trader={max_per_trader} refresh_leaders={refresh_leaders_secs}s");
     println!(
+        "plan_c: market_affinity_weight={market_affinity_weight} max_cost_premium={max_cost_premium} min_edge_retention={min_edge_retention}"
+    );
+    println!(
         "plan_c: exit_mode={:?} leader_sell_max_age_secs={leader_sell_max_age_secs}",
         exit_mode
     );
     println!(
-        "plan_c: quality_gates min_copy_score={:.2} require_closed_trades={} min_closed_trades={}",
-        min_copy_score, require_closed_trades, min_closed_trades
+        "plan_c: quality_gates (legacy, disabled) — filter now driven by scan_mode_gates above"
     );
     println!(
         "plan_c: persist_windows={:?} persist_min_net={} persist_min_closes={}",
@@ -3235,151 +3403,186 @@ pub(crate) async fn run_plan_c_loop<C>(
             }
         }
 
-        let mut force_refresh = false;
-        if !last_top20_snapshot.is_empty() && !qualified_traders.is_empty() {
-            if let Ok(snap_entries) = fetch_leaderboard(&http, 20, "WEEK", "PNL").await {
-                let new_snap: Vec<String> = snap_entries
-                    .into_iter()
-                    .filter_map(|e| e.proxy_wallet.map(|a| a.trim().to_lowercase()))
-                    .take(20)
-                    .collect();
-                let overlap = leaderboard_top_overlap(&last_top20_snapshot, &new_snap);
-                if overlap < 1.0 - refresh_churn_threshold {
-                    println!(
-                        "plan_c: WEEK PNL top-20 churn (overlap={:.2} < {:.2}) — forcing leader refresh",
-                        overlap,
-                        1.0 - refresh_churn_threshold
-                    );
-                    force_refresh = true;
+        if !manual_leader_mode {
+            let mut force_refresh = false;
+            if !last_top20_snapshot.is_empty() && !qualified_traders.is_empty() {
+                if let Ok(snap_entries) = fetch_leaderboard(&http, 20, "WEEK", "PNL").await {
+                    let new_snap: Vec<String> = snap_entries
+                        .into_iter()
+                        .filter_map(|e| e.proxy_wallet.map(|a| a.trim().to_lowercase()))
+                        .take(20)
+                        .collect();
+                    let overlap = leaderboard_top_overlap(&last_top20_snapshot, &new_snap);
+                    if overlap < 1.0 - refresh_churn_threshold {
+                        println!(
+                            "plan_c: WEEK PNL top-20 churn (overlap={:.2} < {:.2}) — forcing leader refresh",
+                            overlap,
+                            1.0 - refresh_churn_threshold
+                        );
+                        force_refresh = true;
+                    }
                 }
             }
-        }
 
-        if force_refresh
-            || now - last_leader_refresh >= refresh_leaders_secs as i64
-            || qualified_traders.is_empty()
-        {
-            println!(
-                "\n================ plan_c round #{loop_idx} — refreshing leaders ================\n"
-            );
-            let (q, top20) = discover_qualified_traders(
-                &http,
-                use_multi_leaderboard,
-                leaderboard_limit,
-                candidate_pool_max,
-                leaderboard_limit,
-                &period,
-                min_pnl,
-                min_volume,
-                min_realized_pnl,
-                max_market_concentration,
-                max_unrealized_ratio,
-                analysis_hours,
-                min_avg_interval_secs,
-                max_trades_in_window,
-                min_interval_stddev,
-                max_active_hour_ratio,
-                recent_window_hours,
-                max_notional_cv,
-                min_market_diversity,
-                max_size_p99_p50,
-                pf_alpha,
-                pf_beta,
-                w_ret,
-                w_wr,
-                w_pf,
-                w_rr,
-                w_dd,
-                min_copy_score,
-                require_closed_trades,
-                min_closed_trades,
-                persist_windows_days.clone(),
-                persist_min_net,
-                persist_min_closes,
-                analyze_concurrency,
-            )
-            .await;
-            qualified_traders = q;
-            last_top20_snapshot = top20;
+            if force_refresh
+                || now - last_leader_refresh >= refresh_leaders_secs as i64
+                || qualified_traders.is_empty()
+            {
+                println!(
+                    "\n================ plan_c round #{loop_idx} — refreshing leaders ================\n"
+                );
+                let (q, top20) = discover_qualified_traders(
+                    &http,
+                    use_multi_leaderboard,
+                    leaderboard_limit,
+                    candidate_pool_max,
+                    leaderboard_limit,
+                    &period,
+                    min_pnl,
+                    min_volume,
+                    min_active_positions,
+                    min_address_usdc,
+                    min_win_rate,
+                    rpc_urls_all.clone(),
+                    usdc_addr_raw.clone(),
+                    analysis_hours,
+                    min_avg_interval_secs,
+                    max_trades_in_window,
+                    min_interval_stddev,
+                    max_active_hour_ratio,
+                    recent_window_hours,
+                    max_notional_cv,
+                    min_market_diversity,
+                    max_size_p99_p50,
+                    pf_alpha,
+                    pf_beta,
+                    w_ret,
+                    w_wr,
+                    w_pf,
+                    w_rr,
+                    w_dd,
+                    min_closed_trades,
+                    persist_windows_days.clone(),
+                    persist_min_net,
+                    persist_min_closes,
+                    analyze_concurrency,
+                )
+                .await;
+                qualified_traders = q;
+                last_top20_snapshot = top20;
+                last_leader_refresh = now;
+
+                if qualified_traders.is_empty() {
+                    println!("plan_c: no qualified traders found, retrying in 5 minutes");
+                    time::sleep(Duration::from_secs(300)).await;
+                    continue;
+                }
+
+                // Solo‑leader narrowing: keep only the single best trader.
+                // Selection rule:
+                //   1. Prefer traders with persistent_profit = true (profitable in
+                //      every configured window — see `compute_persistence`).
+                //   2. Among those, pick the highest ROI (= pnl / volume on the
+                //      leaderboard period; this is the "盈利率" the operator asked for).
+                //   3. If no trader clears the persistent_profit bar, fall back to
+                //      highest ROI overall so we still have a leader to follow
+                //      instead of silently idling.
+                if solo_leader_mode {
+                    let mut pool_persistent: Vec<QualifiedTrader> = qualified_traders
+                        .iter()
+                        .filter(|t| t.persistent_profit)
+                        .cloned()
+                        .collect();
+                    let chosen = if !pool_persistent.is_empty() {
+                        pool_persistent.sort_by(|a, b| {
+                            b.roi
+                                .partial_cmp(&a.roi)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| {
+                                    b.score
+                                        .partial_cmp(&a.score)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                        });
+                        pool_persistent.into_iter().next()
+                    } else {
+                        let mut pool_all = qualified_traders.clone();
+                        pool_all.sort_by(|a, b| {
+                            b.roi
+                                .partial_cmp(&a.roi)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| {
+                                    b.score
+                                        .partial_cmp(&a.score)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                        });
+                        if !pool_all.is_empty() {
+                            println!(
+                                "plan_c: SOLO_LEADER — no persistent_profit trader in pool of {}, falling back to highest ROI overall",
+                                pool_all.len()
+                            );
+                        }
+                        pool_all.into_iter().next()
+                    };
+
+                    match chosen {
+                        Some(pick) => {
+                            println!(
+                                "plan_c: SOLO_LEADER picked {} addr={} roi={:.4} pnl={:.0} vol={:.0} score={:.2} persistent={} — tracking every {}s",
+                                pick.user_name,
+                                pick.address,
+                                pick.roi,
+                                pick.pnl,
+                                pick.volume,
+                                pick.score,
+                                pick.persistent_profit,
+                                solo_leader_poll_secs,
+                            );
+                            qualified_traders = vec![pick];
+                        }
+                        None => {
+                            println!("plan_c: SOLO_LEADER — no candidate available this cycle, sleeping 5 minutes");
+                            qualified_traders.clear();
+                            time::sleep(Duration::from_secs(300)).await;
+                            continue;
+                        }
+                    }
+                }
+            }
+        } else if qualified_traders.is_empty() {
+            qualified_traders = user_addresses
+                .iter()
+                .map(|addr| QualifiedTrader {
+                    address: addr.clone(),
+                    user_name: addr.clone(),
+                    pnl: 0.0,
+                    volume: 0.0,
+                    avg_interval_secs: 0.0,
+                    trade_count: 0,
+                    roi: 0.0,
+                    sharpe_7d: 0.0,
+                    ret_7d: 0.0,
+                    win_rate: 0.0,
+                    profit_factor: 0.0,
+                    recent_roi: 0.0,
+                    max_drawdown: 0.0,
+                    score: 0.0,
+                    persistent_profit: true,
+                    window_nets: Vec::new(),
+                    pnl_by_condition: HashMap::new(),
+                })
+                .collect();
             last_leader_refresh = now;
-
-            if qualified_traders.is_empty() {
-                println!("plan_c: no qualified traders found, retrying in 5 minutes");
-                time::sleep(Duration::from_secs(300)).await;
-                continue;
-            }
-
-            // Solo‑leader narrowing: keep only the single best trader.
-            // Selection rule:
-            //   1. Prefer traders with persistent_profit = true (profitable in
-            //      every configured window — see `compute_persistence`).
-            //   2. Among those, pick the highest ROI (= pnl / volume on the
-            //      leaderboard period; this is the "盈利率" the operator asked for).
-            //   3. If no trader clears the persistent_profit bar, fall back to
-            //      highest ROI overall so we still have a leader to follow
-            //      instead of silently idling.
-            if solo_leader_mode {
-                let mut pool_persistent: Vec<QualifiedTrader> = qualified_traders
+            println!(
+                "plan_c: manual leaders loaded ({}): {}",
+                qualified_traders.len(),
+                qualified_traders
                     .iter()
-                    .filter(|t| t.persistent_profit)
-                    .cloned()
-                    .collect();
-                let chosen = if !pool_persistent.is_empty() {
-                    pool_persistent.sort_by(|a, b| {
-                        b.roi
-                            .partial_cmp(&a.roi)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| {
-                                b.score
-                                    .partial_cmp(&a.score)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                    });
-                    pool_persistent.into_iter().next()
-                } else {
-                    let mut pool_all = qualified_traders.clone();
-                    pool_all.sort_by(|a, b| {
-                        b.roi
-                            .partial_cmp(&a.roi)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| {
-                                b.score
-                                    .partial_cmp(&a.score)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                    });
-                    if !pool_all.is_empty() {
-                        println!(
-                            "plan_c: SOLO_LEADER — no persistent_profit trader in pool of {}, falling back to highest ROI overall",
-                            pool_all.len()
-                        );
-                    }
-                    pool_all.into_iter().next()
-                };
-
-                match chosen {
-                    Some(pick) => {
-                        println!(
-                            "plan_c: SOLO_LEADER picked {} addr={} roi={:.4} pnl={:.0} vol={:.0} score={:.2} persistent={} — tracking every {}s",
-                            pick.user_name,
-                            pick.address,
-                            pick.roi,
-                            pick.pnl,
-                            pick.volume,
-                            pick.score,
-                            pick.persistent_profit,
-                            solo_leader_poll_secs,
-                        );
-                        qualified_traders = vec![pick];
-                    }
-                    None => {
-                        println!("plan_c: SOLO_LEADER — no candidate available this cycle, sleeping 5 minutes");
-                        qualified_traders.clear();
-                        time::sleep(Duration::from_secs(300)).await;
-                        continue;
-                    }
-                }
-            }
+                    .map(|t| t.address.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
 
         // Fetch trades once per round for the union of:
@@ -3993,7 +4196,12 @@ pub(crate) async fn run_plan_c_loop<C>(
             // we only advance it per-trader once a signal has actually been decided on.
             let collection_now = Utc::now().timestamp();
             let stale_cutoff = collection_now - max_trade_age_secs;
-            let mut pending: Vec<(f64, usize, TradeRecord)> = Vec::new();
+            // Tuple layout: (trader_score, market_affinity, trader_idx, trade).
+            // `market_affinity` is the leader's historical FIFO-realized PnL in
+            // this specific `condition_id` (0 when the leader has never touched
+            // this market). It's used purely as a tiebreaker so mixing traders
+            // still sorts primarily by `trader_score`.
+            let mut pending: Vec<(f64, f64, usize, TradeRecord)> = Vec::new();
             // Per-trader max ts we will consider advancing last_seen to, populated as
             // we decide on each pending signal below.
             let mut advance_ts: HashMap<String, i64> = HashMap::new();
@@ -4088,7 +4296,27 @@ pub(crate) async fn run_plan_c_loop<C>(
                     funnel_fresh_buys += 1;
                     let age = collection_now - ts;
                     newest_fresh_age = Some(newest_fresh_age.map_or(age, |o| o.min(age)));
-                    pending.push((trader.score, idx, t.clone()));
+                    // Per-market affinity tiebreaker. When the leader has a
+                    // positive FIFO track record in this condition_id it ranks
+                    // ahead of their other fresh signals; unknown cids default
+                    // to 0 (neutral). Gated by the operator-facing weight so
+                    // setting it to 0 restores the original FCFS behaviour.
+                    let cid_key = t
+                        .condition_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let affinity = if market_affinity_weight > 0.0 {
+                        cid_key
+                            .as_deref()
+                            .and_then(|c| trader.pnl_by_condition.get(c).copied())
+                            .unwrap_or(0.0)
+                            * market_affinity_weight
+                    } else {
+                        0.0
+                    };
+                    pending.push((trader.score, affinity, idx, t.clone()));
                 }
             }
 
@@ -4111,16 +4339,27 @@ pub(crate) async fn run_plan_c_loop<C>(
                 pending.len(),
             );
 
-            // Step 2: prioritise by trader score (descending). Ties preserve insertion
-            // order which roughly follows leaderboard order from step 1.
-            pending.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            // Step 2: prioritise by (trader_score desc, market_affinity desc).
+            // Primary key is trader_score, so mixing different leaders keeps the
+            // same overall order as before. Within a single trader's signals the
+            // secondary `market_affinity` key routes the `MAX_PER_TRADER` budget
+            // to condition_ids the leader has historically made money in, rather
+            // than first-come-first-served on timestamp.
+            pending.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        b.1.partial_cmp(&a.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            });
 
             // Step 2b: de-correlate — at most one pending BUY per `condition_id` (best score kept).
             let mut seen_cid: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut unique_pending: Vec<(f64, usize, TradeRecord)> = Vec::new();
-            for triple in pending {
-                let cid_opt = triple
-                    .2
+            let mut unique_pending: Vec<(f64, f64, usize, TradeRecord)> = Vec::new();
+            for tup in pending {
+                let cid_opt = tup
+                    .3
                     .condition_id
                     .as_deref()
                     .map(str::trim)
@@ -4130,7 +4369,7 @@ pub(crate) async fn run_plan_c_loop<C>(
                         continue;
                     }
                 }
-                unique_pending.push(triple);
+                unique_pending.push(tup);
             }
             pending = unique_pending;
 
@@ -4150,7 +4389,7 @@ pub(crate) async fn run_plan_c_loop<C>(
             // that we decide on (copied OR skipped for a non-capacity reason) advances
             // the per-trader watermark. Signals skipped purely due to capacity are left
             // to be re-considered next round (or eventually aged out by max_trade_age).
-            for (score, trader_idx, trade) in pending {
+            for (score, affinity, trader_idx, trade) in pending {
                 let trader = &qualified_traders[trader_idx];
                 let trade_ts = trade.timestamp.unwrap_or(0);
 
@@ -4330,8 +4569,102 @@ pub(crate) async fn run_plan_c_loop<C>(
                 let trade_outcome = trade.outcome.as_deref().unwrap_or("?");
                 let age_secs = (collection_now - trade_ts).max(0);
 
+                // Copy-fidelity profitability gate: we chase the leader's trade
+                // a few hundred ms to minutes later — by the time we get here
+                // the book may have moved. Compare the current best_ask to the
+                // leader's entry; if the market has priced in too much of the
+                // edge (or the gap to their fill is too wide), skip this copy
+                // rather than post a stale bid that either chases at a loss or
+                // rots in the book until `PENDING_TIMEOUT_SECS`.
+                //
+                // Gate is always advisory on fetch failure: we proceed and let
+                // the existing pending-timeout + stop_loss machinery handle any
+                // resulting bad fill rather than introduce a new veto that
+                // depends on the clob-price endpoint being up.
+                let (best_ask_opt, unprofitable_reason) = match fetch_clob_best_ask(&token_id).await
+                {
+                    Ok(ask) => {
+                        let one = Decimal::ONE;
+                        let cost_premium = ask - trade_price;
+                        // 1) absolute cents-over-leader cap.
+                        let cap_exceeded =
+                            max_cost_premium < one && cost_premium > max_cost_premium;
+                        // 2) retained share of leader's optimistic upside.
+                        // `effective_cost` is what we'd actually pay if we had
+                        // to cross to fill right now — our bid if it's already
+                        // at/above the ask, otherwise the ask itself.
+                        let effective_cost = if buy_price >= ask { buy_price } else { ask };
+                        let leader_upside = one - trade_price;
+                        let my_upside = one - effective_cost;
+                        let retention_ok = if min_edge_retention <= 0.0
+                            || leader_upside <= Decimal::ZERO
+                        {
+                            true
+                        } else {
+                            let ratio_raw = my_upside
+                                .checked_div(leader_upside)
+                                .unwrap_or(Decimal::ZERO);
+                            // Convert to f64 once at the edge for the threshold compare.
+                            let ratio_f: f64 = ratio_raw
+                                .to_string()
+                                .parse::<f64>()
+                                .unwrap_or(0.0);
+                            ratio_f >= min_edge_retention
+                        };
+                        let reason = if cap_exceeded {
+                            Some(format!(
+                                "ask_premium={} > cap={}",
+                                cost_premium, max_cost_premium
+                            ))
+                        } else if !retention_ok {
+                            let ratio_str = if leader_upside <= Decimal::ZERO {
+                                "n/a".to_string()
+                            } else {
+                                let r = my_upside
+                                    .checked_div(leader_upside)
+                                    .unwrap_or(Decimal::ZERO);
+                                format!("{:.2}", r)
+                            };
+                            Some(format!(
+                                "edge_retention={} < min={:.2}",
+                                ratio_str, min_edge_retention
+                            ))
+                        } else {
+                            None
+                        };
+                        (Some(ask), reason)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "plan_c: warn: fetch_clob_best_ask failed for {}: {} — proceeding without profitability gate",
+                            token_id, e
+                        );
+                        (None, None)
+                    }
+                };
+                if let Some(reason) = unprofitable_reason {
+                    let ask_display = best_ask_opt
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "n/a".to_string());
+                    println!(
+                        "plan_c: SKIP (unprofitable) — trader={} market=\"{}\" leader_price={} our_bid={} best_ask={} age={}s ({})",
+                        trader.user_name,
+                        trade_title,
+                        trade_price,
+                        buy_price,
+                        ask_display,
+                        age_secs,
+                        reason,
+                    );
+                    mark_processed(&trader.address, trade_ts);
+                    continue;
+                }
+                let best_ask_log = best_ask_opt
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "n/a".to_string());
+
                 println!(
-                    "plan_c: COPY BUY — trader={} (score={:.2} rot={:.4} sharpe7d={:.2} wr_lcb={:.2} pf={:.2} recent_roi={:.2} max_dd={:.0}) market=\"{}\" outcome={} order_usd={} price={} size={} age={}s (leader pnl={:.0} leader_notional=${:.0})",
+                    "plan_c: COPY BUY — trader={} (score={:.2} rot={:.4} sharpe7d={:.2} wr_lcb={:.2} pf={:.2} recent_roi={:.2} max_dd={:.0}) market=\"{}\" outcome={} order_usd={} price={} size={} age={}s best_ask={} affinity={:.0} (leader pnl={:.0} leader_notional=${:.0})",
                     trader.user_name,
                     score,
                     trader.roi,
@@ -4346,6 +4679,8 @@ pub(crate) async fn run_plan_c_loop<C>(
                     buy_price,
                     size,
                     age_secs,
+                    best_ask_log,
+                    affinity,
                     trader.pnl,
                     leader_notional_f
                 );
