@@ -2390,13 +2390,17 @@ fn analyze_trader_full(
     };
 
     // Bot filter v2 — avoid rejecting MM on interval alone.
+    // Extra low-volume guard: a tiny burst of ultra-short-interval trades
+    // (e.g. 3 trades 20s apart on a throwaway account) bypassed every
+    // `trade_count > N` gate above. Catch it cheaply with a hard minimum.
     let is_bot = (trade_count > max_trades_in_window)
         || (avg_interval_secs < 60.0 && notional_cv < max_notional_cv && trade_count > 10)
         || (trade_count > 30 && avg_interval_secs < min_avg_interval_secs)
         || ((interval_stddev < min_interval_stddev) && (trade_count > 20))
         || ((active_hour_ratio > max_active_hour_ratio) && (trade_count > 50))
         || (trade_count > 25 && market_diversity < min_market_diversity)
-        || (size_p99_p50 > max_size_p99_p50);
+        || (size_p99_p50 > max_size_p99_p50)
+        || (avg_interval_secs < min_avg_interval_secs && trade_count >= 3);
 
     TraderAnalysis {
         avg_interval_secs,
@@ -2478,6 +2482,11 @@ async fn discover_qualified_traders(
     persist_windows_days: Vec<u64>,
     persist_min_net: f64,
     persist_min_closes: usize,
+    min_copy_score: f64,
+    min_sharpe_7d: f64,
+    max_dd_penalty_threshold: f64,
+    min_profit_factor: f64,
+    require_persistent: bool,
     max_concurrency: usize,
 ) -> (Vec<QualifiedTrader>, Vec<String>) {
     let http_c = http.clone();
@@ -2652,13 +2661,14 @@ async fn discover_qualified_traders(
                 0.0
             };
 
-            // Scan-mode hard gate #3: FIFO raw win rate with a minimum-sample
-            // floor. `min_closed_trades` is reused here as the "statistical
-            // significance" guard so `1/1 = 100%` can't slip through.
-            if full.total < min_closed_trades || win_rate_raw < min_win_rate {
+            // Scan-mode hard gate #3: Wilson 95% lower-bound win rate with a
+            // minimum-sample floor. Using the LCB (not raw wins/total) blocks
+            // small-sample high-rate flukes (e.g. 4/5 = 0.80 has LCB ≈ 0.37).
+            let wilson_wr_gate = wilson_lower_bound(full.wins, full.total, 1.96);
+            if full.total < min_closed_trades || wilson_wr_gate < min_win_rate {
                 println!(
-                    "plan_c: FILTERED (win_rate) {} win_rate={:.2} closed={} (need wr>={:.2} and closed>={})",
-                    user_name, win_rate_raw, full.total, min_win_rate, min_closed_trades
+                    "plan_c: FILTERED (win_rate) {} wr_lcb={:.2} raw={:.2} closed={} (need wr_lcb>={:.2} and closed>={})",
+                    user_name, wilson_wr_gate, win_rate_raw, full.total, min_win_rate, min_closed_trades
                 );
                 return None;
             }
@@ -2713,13 +2723,46 @@ async fn discover_qualified_traders(
                 format!("{:.0}s", analysis.avg_interval_secs)
             };
 
-            // Scan-mode redesign: `min_copy_score` and `require_closed_trades`
-            // are no longer hard gates. The 5 user-facing rules (pnl, active
-            // positions, address USDC, win_rate, volume) + bot filter already
-            // decided acceptance above. `score` is kept purely for ranking/logs.
+            // Hard gates re-armed after the Apr-22 post-mortem. Ordering
+            // matters only for log readability — any one failing kicks out.
+            if score < min_copy_score {
+                println!(
+                    "plan_c: FILTERED (score) {} score={:.2} < {:.2}",
+                    user_name, score, min_copy_score
+                );
+                return None;
+            }
+            if analysis.sharpe_7d < min_sharpe_7d {
+                println!(
+                    "plan_c: FILTERED (sharpe) {} sharpe7d={:.2} < {:.2}",
+                    user_name, analysis.sharpe_7d, min_sharpe_7d
+                );
+                return None;
+            }
+            if dd_penalty > max_dd_penalty_threshold {
+                println!(
+                    "plan_c: FILTERED (drawdown) {} dd_pen={:.2} > {:.2}",
+                    user_name, dd_penalty, max_dd_penalty_threshold
+                );
+                return None;
+            }
+            if analysis.profit_factor < min_profit_factor {
+                println!(
+                    "plan_c: FILTERED (pf) {} pf={:.2} < {:.2}",
+                    user_name, analysis.profit_factor, min_profit_factor
+                );
+                return None;
+            }
 
             let (persistent_profit, window_nets) =
                 compute_persistence(&trades, &windows, pmin, pcl);
+            if require_persistent && !persistent_profit {
+                println!(
+                    "plan_c: FILTERED (persist) {} persist=false",
+                    user_name
+                );
+                return None;
+            }
             let windows_fmt = window_nets
                 .iter()
                 .map(|(d, n)| format!("{}:{:.0}", d, n))
@@ -2848,6 +2891,14 @@ pub(crate) async fn run_plan_c_loop<C>(
     let w_pf = read_f64_env_or(dotenv_path, "PLAN_C_W_PROFIT_FACTOR", 0.20);
     let w_rr = read_f64_env_or(dotenv_path, "PLAN_C_W_RECENT_ROI", 0.15);
     let w_dd = read_f64_env_or(dotenv_path, "PLAN_C_W_DRAWDOWN", 0.15);
+    // Extra hard gates added after the Apr-22 post-mortem. Any leader failing
+    // one of these is dropped before the QUALIFIED log — they ride *on top of*
+    // the scan-mode pnl/vol/positions/usdc/wr/closed gates, not in place of.
+    let min_sharpe_7d = read_f64_env_or(dotenv_path, "PLAN_C_MIN_SHARPE_7D", 0.3);
+    let max_dd_penalty = read_f64_env_or(dotenv_path, "PLAN_C_MAX_DD_PENALTY", 0.50);
+    let min_profit_factor = read_f64_env_or(dotenv_path, "PLAN_C_MIN_PROFIT_FACTOR", 2.5);
+    let require_persistent =
+        crate::read_bool_env_or(dotenv_path, "PLAN_C_REQUIRE_PERSISTENT", true);
     let order_usd_base = if let Some(s) = resolve_runtime_var("PLAN_C_ORDER_USD_BASE", dotenv_path) {
         Decimal::from_str(s.trim()).unwrap_or_else(|_| Decimal::from(5_u32))
     } else {
@@ -3057,10 +3108,10 @@ pub(crate) async fn run_plan_c_loop<C>(
     );
     let min_edge_retention = read_f64_env_or(dotenv_path, "PLAN_C_MIN_EDGE_RETENTION", 0.70);
 
-    // Legacy quality gates — no longer used as filter gates, kept purely so
-    // existing `.env` files with these keys don't surprise operators. The
-    // composite `score` is still computed for logging + secondary sort.
-    let _min_copy_score = read_f64_env_or(dotenv_path, "PLAN_C_MIN_COPY_SCORE", 0.0);
+    // Composite `score` cutoff — re-armed as a hard gate after the Apr-18/22
+    // post-mortem showed `_min_copy_score` had been dead code since the scan-
+    // mode redesign, letting sub-threshold leaders slip through.
+    let min_copy_score = read_f64_env_or(dotenv_path, "PLAN_C_MIN_COPY_SCORE", 0.45);
     let _require_closed_trades =
         crate::read_bool_env_or(dotenv_path, "PLAN_C_REQUIRE_CLOSED_TRADES", false);
     // `min_closed_trades` IS still used — re-purposed as the minimum-sample
@@ -3465,6 +3516,11 @@ pub(crate) async fn run_plan_c_loop<C>(
                     persist_windows_days.clone(),
                     persist_min_net,
                     persist_min_closes,
+                    min_copy_score,
+                    min_sharpe_7d,
+                    max_dd_penalty,
+                    min_profit_factor,
+                    require_persistent,
                     analyze_concurrency,
                 )
                 .await;
