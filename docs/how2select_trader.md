@@ -21,7 +21,7 @@
 1. **Overall PnL 门槛** — 来自 leaderboard entry：`pnl >= PLAN_C_MIN_PNL`（默认 20000，USD）。
 2. **交易量门槛** — `volume >= PLAN_C_MIN_VOLUME`（默认 0，事实上关闭；保留 env 以便需要时再启用）。
 3. **Active Positions 门槛** — 调 `data-api.polymarket.com/positions?sizeThreshold=0.01`，计数满足 `size>0.01 && curPrice>0 && !redeemable` 的条目（见 `count_active_open_positions`），要求 ≥ `PLAN_C_MIN_ACTIVE_POSITIONS`（默认 2）。排除了已结算等待赎回的"僵尸仓位"。
-4. **地址 USDC 余额门槛** — 用 `fetch_usdc_balance_multi`（`src/healthcheck.rs`）在 `PLAN_C_RPC_URLS` 列表上做多 RPC 故障转移，查询 `PLAN_C_USDC_ADDRESS` 余额 ≥ `PLAN_C_MIN_ADDRESS_USDC`（默认 20000 USDC）。任一候选的 RPC 全部失败即判不通过（保守策略，避免跟单到没有实际资金的钱包）。
+4. **地址 pUSD 余额门槛** — 用 `fetch_pusd_balance_multi`（`src/healthcheck.rs`，原名 `fetch_usdc_balance_multi`，2026-04-28 V2 cutover 后改名）在 `PLAN_C_RPC_URLS` 列表上做多 RPC 故障转移，查询 `PLAN_C_COLLATERAL_ADDRESS`（旧 alias `PLAN_C_USDC_ADDRESS` 仍可用）余额 ≥ `PLAN_C_MIN_ADDRESS_PUSD`（旧 alias `PLAN_C_MIN_ADDRESS_USDC`，默认 20000 pUSD）。任一候选的 RPC 全部失败即判不通过（保守策略，避免跟单到没有实际资金的钱包）。
 5. **Win Rate 门槛** — 调 `fetch_user_trades(limit=500)` → `fifo_pnl_aggregate(trades, None)`，计算 `win_rate_raw = wins / total`，要求 `win_rate_raw >= PLAN_C_MIN_WIN_RATE`（默认 0.80）**且** `total >= PLAN_C_MIN_CLOSED_TRADES`（默认 10，作为最小样本量守卫，防止 1/1 = 100% 蒙混）。
 
 **市场不限**：旧版 `PLAN_C_MAX_MARKET_CONCENTRATION` 的单市场集中度限制已移除——任何市场组合都被允许通过候选阶段（下单阶段仍有 `PLAN_C_BLOCKED_KEYWORDS` 关键词黑名单在，与这里无关）。
@@ -73,7 +73,7 @@
 - 单领导者最多并存仓位数 `PLAN_C_MAX_PER_TRADER`（默认 2）
 - 全局最多仓位数 `PLAN_C_MAX_POSITIONS`（默认 5）
 - 领导者挂单时间新鲜度 `PLAN_C_MAX_TRADE_AGE_SECS`（默认 180s）
-- 领导者单笔名义金额 `PLAN_C_MIN_LEADER_NOTIONAL`（默认 100 USDC）
+- 领导者单笔名义金额 `PLAN_C_MIN_LEADER_NOTIONAL`（默认 100 pUSD；2026-04-28 V2 cutover 前为 USDC.e）
 - 市场关键字黑名单 `PLAN_C_BLOCKED_KEYWORDS`（默认屏蔽 esports 类）
 - 最大买入价 `PLAN_C_MAX_BUY_PRICE`（默认 0.90）
 

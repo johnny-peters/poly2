@@ -15,7 +15,7 @@ strategies:
 risk:
   max_position_pct: '0.10'
   max_single_trade_pct: '0.10'
-  daily_loss_limit_pct: '0.05'
+  daily_loss_limit_pct: '0.2'
 
 execution:
   polymarket_ws_url: 'wss://ws-subscriptions-clob.polymarket.com/ws'

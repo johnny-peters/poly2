@@ -1385,7 +1385,7 @@ async fn build_redeem_client(
     rpc_url: &str,
     ctf_addr_raw: &str,
     neg_risk_addr_raw: &str,
-    usdc_addr_raw: &str,
+    collateral_addr_raw: &str,
     proxy_wallet: Option<&str>,
 ) -> anyhow::Result<crate::plan_c_redeem::RedeemClient> {
     use alloy::primitives::Address;
@@ -1412,10 +1412,12 @@ async fn build_redeem_client(
         .trim()
         .parse()
         .with_context(|| format!("invalid PLAN_C_NEG_RISK_ADAPTER '{neg_risk_addr_raw}'"))?;
-    let usdc_address: Address = usdc_addr_raw
+    let collateral_address: Address = collateral_addr_raw
         .trim()
         .parse()
-        .with_context(|| format!("invalid PLAN_C_USDC_ADDRESS '{usdc_addr_raw}'"))?;
+        .with_context(|| {
+            format!("invalid PLAN_C_COLLATERAL_ADDRESS '{collateral_addr_raw}'")
+        })?;
 
     crate::plan_c_redeem::RedeemClient::new(
         rpc_url,
@@ -1423,7 +1425,7 @@ async fn build_redeem_client(
         position_holder,
         ctf_address,
         neg_risk_adapter,
-        usdc_address,
+        collateral_address,
     )
     .await
 }
@@ -2458,10 +2460,10 @@ async fn discover_qualified_traders(
     min_pnl: f64,
     min_volume: f64,
     min_active_positions: usize,
-    min_address_usdc: f64,
+    min_address_pusd: f64,
     min_win_rate: f64,
     rpc_urls: Vec<String>,
-    usdc_address: String,
+    collateral_address: String,
     analysis_hours: u64,
     min_avg_interval_secs: f64,
     max_trades_in_window: usize,
@@ -2531,14 +2533,14 @@ async fn discover_qualified_traders(
         "single_period"
     };
     println!(
-        "plan_c: leaderboard returned {} entries (mode={} period={} min_pnl={} min_vol={} min_active_positions={} min_address_usdc={} min_win_rate={:.2} min_closed={})",
+        "plan_c: leaderboard returned {} entries (mode={} period={} min_pnl={} min_vol={} min_active_positions={} min_address_pusd={} min_win_rate={:.2} min_closed={})",
         entries.len(),
         mode,
         period,
         min_pnl,
         min_volume,
         min_active_positions,
-        min_address_usdc,
+        min_address_pusd,
         min_win_rate,
         min_closed_trades,
     );
@@ -2551,7 +2553,7 @@ async fn discover_qualified_traders(
         let pmin = persist_min_net;
         let pcl = persist_min_closes;
         let rpc_urls_local = rpc_urls.clone();
-        let usdc_addr_local = usdc_address.clone();
+        let collateral_addr_local = collateral_address.clone();
         futs.push(async move {
             let address = match entry.proxy_wallet {
                 Some(ref a) if !a.trim().is_empty() => a.trim().to_string(),
@@ -2599,9 +2601,11 @@ async fn discover_qualified_traders(
                 return None;
             }
 
-            // Scan-mode hard gate #2: on-chain USDC balance across fallback RPCs.
-            // Any RPC failure across all providers is treated as "not qualified"
-            // — we'd rather drop a candidate than copy-trade a ghost wallet.
+            // Scan-mode hard gate #2: on-chain pUSD balance across fallback RPCs.
+            // (Pre-2026-04-28 V2 cutover this was USDC.e; both tokens are
+            // 6-decimal ERC-20s so the wire-level call is identical.) Any RPC
+            // failure across all providers is treated as "not qualified" — we'd
+            // rather drop a candidate than copy-trade a ghost wallet.
             let rpc_refs: Vec<&str> =
                 rpc_urls_local.iter().map(|s| s.as_str()).collect();
             let balance = if rpc_refs.is_empty() {
@@ -2611,9 +2615,9 @@ async fn discover_qualified_traders(
                 );
                 return None;
             } else {
-                match poly2::fetch_usdc_balance_multi(
+                match poly2::fetch_pusd_balance_multi(
                     &rpc_refs,
-                    &usdc_addr_local,
+                    &collateral_addr_local,
                     &address,
                 )
                 .await
@@ -2634,10 +2638,10 @@ async fn discover_qualified_traders(
                 .to_string()
                 .parse::<f64>()
                 .unwrap_or(0.0);
-            if balance_f64 < min_address_usdc {
+            if balance_f64 < min_address_pusd {
                 println!(
-                    "plan_c: FILTERED (balance) {} wallet_usdc={:.0} < {:.0}",
-                    user_name, balance_f64, min_address_usdc
+                    "plan_c: FILTERED (balance) {} wallet_pusd={:.0} < {:.0}",
+                    user_name, balance_f64, min_address_pusd
                 );
                 return None;
             }
@@ -2851,8 +2855,14 @@ pub(crate) async fn run_plan_c_loop<C>(
     // `docs/how2select_trader.md` for the current rule set.
     let min_active_positions =
         read_u64_env_or(dotenv_path, "PLAN_C_MIN_ACTIVE_POSITIONS", 2) as usize;
-    let min_address_usdc =
-        read_f64_env_or(dotenv_path, "PLAN_C_MIN_ADDRESS_USDC", 20000.0);
+    // 2026-04-28 V2 cutover: collateral is now pUSD. Prefer the new env name,
+    // but accept the legacy `PLAN_C_MIN_ADDRESS_USDC` so existing `.env` files
+    // keep working until operators migrate.
+    let min_address_pusd = read_f64_env_or(
+        dotenv_path,
+        "PLAN_C_MIN_ADDRESS_PUSD",
+        read_f64_env_or(dotenv_path, "PLAN_C_MIN_ADDRESS_USDC", 20000.0),
+    );
     let min_win_rate = read_f64_env_or(dotenv_path, "PLAN_C_MIN_WIN_RATE", 0.80);
     // Legacy env vars retained purely to avoid "missing key" surprises in
     // existing `.env` files; they are no longer used as filter gates.
@@ -3054,8 +3064,13 @@ pub(crate) async fn run_plan_c_loop<C>(
         .unwrap_or_else(|| crate::plan_c_redeem::DEFAULT_CTF_ADDRESS.to_string());
     let neg_risk_addr_raw = resolve_runtime_var("PLAN_C_NEG_RISK_ADAPTER", dotenv_path)
         .unwrap_or_else(|| crate::plan_c_redeem::DEFAULT_NEG_RISK_ADAPTER.to_string());
-    let usdc_addr_raw = resolve_runtime_var("PLAN_C_USDC_ADDRESS", dotenv_path)
-        .unwrap_or_else(|| crate::plan_c_redeem::DEFAULT_USDC_ADDRESS.to_string());
+    // Settlement collateral address. Post 2026-04-28 V2 cutover this is pUSD
+    // (`0xC011a7E1…`). Accept the legacy `PLAN_C_USDC_ADDRESS` env name as an
+    // alias so existing `.env` files keep working until operators migrate.
+    #[allow(deprecated)]
+    let collateral_addr_raw = resolve_runtime_var("PLAN_C_COLLATERAL_ADDRESS", dotenv_path)
+        .or_else(|| resolve_runtime_var("PLAN_C_USDC_ADDRESS", dotenv_path))
+        .unwrap_or_else(|| crate::plan_c_redeem::DEFAULT_COLLATERAL_ADDRESS.to_string());
     let redeem_max_retries =
         read_u64_env_or(dotenv_path, "PLAN_C_REDEEM_MAX_RETRIES", 5) as u32;
     let redeem_backoff_secs =
@@ -3146,11 +3161,11 @@ pub(crate) async fn run_plan_c_loop<C>(
 
     println!("plan_c: leaderboard_limit={leaderboard_limit} candidate_pool_max={candidate_pool_max} period={period} multi_lb={use_multi_leaderboard}");
     println!(
-        "plan_c: scan_mode_gates min_pnl={} min_volume={} min_active_positions={} min_address_usdc={} min_win_rate={:.2} min_closed_trades={}",
+        "plan_c: scan_mode_gates min_pnl={} min_volume={} min_active_positions={} min_address_pusd={} min_win_rate={:.2} min_closed_trades={}",
         min_pnl,
         min_volume,
         min_active_positions,
-        min_address_usdc,
+        min_address_pusd,
         min_win_rate,
         min_closed_trades,
     );
@@ -3220,7 +3235,7 @@ pub(crate) async fn run_plan_c_loop<C>(
         max_buy_price
     );
     println!(
-        "plan_c: min_cash_reserve_pct={} (keep >= this fraction of equity as free USDC; 0 = disabled)",
+        "plan_c: min_cash_reserve_pct={} (keep >= this fraction of equity as free pUSD; 0 = disabled)",
         min_cash_reserve_pct
     );
     println!(
@@ -3289,6 +3304,59 @@ pub(crate) async fn run_plan_c_loop<C>(
         if is_gnosis_safe { "PM_FUNDER" } else { "PROXY_WALLET" }
     );
 
+    // 2026-04-28 V2 cutover sanity check: if the funder still holds raw
+    // USDC.e and 0 pUSD, the V2 backend will reject every buy because the
+    // CLOB now settles in pUSD. Detect this once at startup and tell the
+    // operator to wrap on polymarket.com instead of failing silently.
+    if let Some(funder) = proxy_wallet.as_deref().filter(|w| !w.is_empty()) {
+        let rpc_refs: Vec<&str> = rpc_urls_all.iter().map(|s| s.as_str()).collect();
+        if !rpc_refs.is_empty() {
+            let pusd_bal = poly2::fetch_pusd_balance_multi(
+                &rpc_refs,
+                &collateral_addr_raw,
+                funder,
+            )
+            .await
+            .ok();
+            let usdce_bal = poly2::fetch_pusd_balance_multi(
+                &rpc_refs,
+                crate::plan_c_redeem::LEGACY_USDCE_ADDRESS,
+                funder,
+            )
+            .await
+            .ok();
+            match (pusd_bal, usdce_bal) {
+                (Some(p), Some(u)) => {
+                    println!(
+                        "plan_c: collateral snapshot — funder={} pUSD={} USDC.e={} (collateral_contract={})",
+                        funder, p, u, collateral_addr_raw
+                    );
+                    let p_zero = p == Decimal::ZERO;
+                    let u_zero = u == Decimal::ZERO;
+                    if p_zero && !u_zero {
+                        eprintln!(
+                            "!! plan_c: detected unwrapped USDC.e={} on funder {} but pUSD=0. Polymarket V2 settles in pUSD only — please wrap on polymarket.com (or call CollateralOnramp {} 'wrap()' directly) before the bot can place buys. Cash-reserve guard will block copy-buys until pUSD > 0.",
+                            u,
+                            funder,
+                            crate::plan_c_redeem::COLLATERAL_ONRAMP_ADDRESS,
+                        );
+                    } else if p_zero && u_zero {
+                        eprintln!(
+                            "!! plan_c: funder {} has 0 pUSD and 0 USDC.e on Polygon — fund the wallet (USDC -> pUSD) before the bot can place buys.",
+                            funder,
+                        );
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "plan_c: collateral snapshot fetch failed across {} rpc(s) — startup wrap check skipped (cash-reserve guard will still gate buys at runtime)",
+                        rpc_refs.len()
+                    );
+                }
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Build the redeem client if auto-redeem is enabled.
     // ------------------------------------------------------------------
@@ -3298,7 +3366,7 @@ pub(crate) async fn run_plan_c_loop<C>(
             &rpc_url,
             &ctf_addr_raw,
             &neg_risk_addr_raw,
-            &usdc_addr_raw,
+            &collateral_addr_raw,
             proxy_wallet.as_deref(),
         )
         .await
@@ -3492,10 +3560,10 @@ pub(crate) async fn run_plan_c_loop<C>(
                     min_pnl,
                     min_volume,
                     min_active_positions,
-                    min_address_usdc,
+                    min_address_pusd,
                     min_win_rate,
                     rpc_urls_all.clone(),
-                    usdc_addr_raw.clone(),
+                    collateral_addr_raw.clone(),
                     analysis_hours,
                     min_avg_interval_secs,
                     max_trades_in_window,
@@ -4273,10 +4341,12 @@ pub(crate) async fn run_plan_c_loop<C>(
                 let wallet = proxy_wallet.as_deref().unwrap_or("");
                 let rpc_refs: Vec<&str> =
                     rpc_urls_all.iter().map(|s| s.as_str()).collect();
-                match poly2::fetch_usdc_balance_multi(&rpc_refs, &usdc_addr_raw, wallet).await {
+                match poly2::fetch_pusd_balance_multi(&rpc_refs, &collateral_addr_raw, wallet)
+                    .await
+                {
                     Ok(bal) => {
                         println!(
-                            "plan_c: cash_reserve check — wallet_usdc={} reserve_pct={} (rpc_urls_tried={})",
+                            "plan_c: cash_reserve check — wallet_pusd={} reserve_pct={} (rpc_urls_tried={})",
                             bal, min_cash_reserve_pct, rpc_refs.len()
                         );
                         Some(bal)

@@ -81,15 +81,26 @@ pub async fn run_healthcheck(execution: &ExecutionSettings, dotenv_path: &Path) 
         .get("RPC_URL")
         .cloned()
         .unwrap_or_else(|| "https://poly.api.pocket.network".to_string());
-    let usdc = env_map
+    // Default fallback is now pUSD (Polymarket V2 collateral, post 2026-04-28).
+    // Operators can still override via `USDC_CONTRACT_ADDRESS` in `.env` to
+    // re-point at the legacy USDC.e address for migration sanity checks.
+    // (Hardcoded here rather than imported from `plan_c_redeem` because the
+    // latter lives in the `poly2` binary crate, not this lib crate.)
+    const PUSD_COLLATERAL_TOKEN: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+    let collateral = env_map
         .get("USDC_CONTRACT_ADDRESS")
         .cloned()
-        .unwrap_or_else(|| "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".to_string());
+        .unwrap_or_else(|| PUSD_COLLATERAL_TOKEN.to_string());
 
     push_result(
         &mut report,
         "clob_http_markets",
         check_clob_http(execution).await,
+    );
+    push_result(
+        &mut report,
+        "clob_v2_version",
+        check_clob_v2_version(execution).await,
     );
     push_result(&mut report, "clob_ws_tcp443", check_ws_tcp(execution));
     push_result(&mut report, "polygon_chain_id", check_chain_id(&rpc_url).await);
@@ -98,13 +109,51 @@ pub async fn run_healthcheck(execution: &ExecutionSettings, dotenv_path: &Path) 
         "polygon_latest_block",
         check_latest_block(&rpc_url).await,
     );
+    // pUSD = Polymarket V2 collateral token (`0xC011a7E1…`). Pre-V2 cutover
+    // this metric was named `polygon_usdc_code` and probed USDC.e
+    // (`0x2791Bca1…`); the fallback above already migrated the address.
     push_result(
         &mut report,
-        "polygon_usdc_code",
-        check_contract_code(&rpc_url, &usdc).await,
+        "polygon_pusd_code",
+        check_contract_code(&rpc_url, &collateral).await,
     );
 
     report
+}
+
+async fn check_clob_v2_version(execution: &ExecutionSettings) -> Result<String> {
+    // Polymarket's CLOB exposes a `GET /version` probe that the V2 SDK uses
+    // for protocol auto-detection. After the 2026-04-28 cutover this should
+    // return a payload identifying the v2 exchange. We only sanity-check the
+    // HTTP status + JSON shape — operators can grep the body field for
+    // post-cutover assertions.
+    let base = execution
+        .polymarket_http_url
+        .as_deref()
+        .unwrap_or("https://clob.polymarket.com");
+    let url = format!("{}/version", base.trim_end_matches('/'));
+    let resp = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(8))
+        .build()
+        .context("clob_v2_version: http client build failed")?
+        .get(&url)
+        .send()
+        .await
+        .context("clob_v2_version: GET /version failed")?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .unwrap_or_else(|_| "(non-text body)".to_string());
+    if !status.is_success() {
+        return Err(anyhow!(
+            "clob_v2_version: GET {url} failed status={status} body_head={}",
+            body.chars().take(120).collect::<String>()
+        ));
+    }
+    let body_head: String = body.chars().take(160).collect();
+    Ok(format!("status={status}, body_head={body_head}"))
 }
 
 pub async fn scan_arb_candidates(
@@ -848,18 +897,49 @@ pub async fn fetch_erc20_balance(
     fetch_erc20_balance_multi(&[rpc_url], contract, wallet, decimals).await
 }
 
-/// Convenience wrapper: query USDC (6-decimal) balance for a wallet, with multi-RPC fallback.
+/// Convenience wrapper: query Polymarket settlement collateral (6-decimal)
+/// balance for a wallet across a list of fallback RPC endpoints. The contract
+/// is whatever the caller passes; pre 2026-04-28 V2 cutover this was USDC.e
+/// `0x2791Bca1…`, post-cutover it's pUSD `0xC011a7E1…`.
+pub async fn fetch_pusd_balance_multi(
+    rpc_urls: &[&str],
+    collateral_contract: &str,
+    wallet: &str,
+) -> Result<Decimal> {
+    fetch_erc20_balance_multi(rpc_urls, collateral_contract, wallet, 6).await
+}
+
+/// Convenience wrapper: query Polymarket settlement collateral (6-decimal)
+/// balance for a wallet on a single RPC endpoint. See [`fetch_pusd_balance_multi`].
+pub async fn fetch_pusd_balance(
+    rpc_url: &str,
+    collateral_contract: &str,
+    wallet: &str,
+) -> Result<Decimal> {
+    fetch_erc20_balance(rpc_url, collateral_contract, wallet, 6).await
+}
+
+/// Backwards-compat alias kept so out-of-tree callers that still reference
+/// `fetch_usdc_balance_multi` keep compiling. Use [`fetch_pusd_balance_multi`]
+/// instead — the wire-level call is identical (both tokens are 6-decimal
+/// ERC-20s), only the conventional contract address has changed.
+#[deprecated(note = "renamed to fetch_pusd_balance_multi (pUSD post 2026-04-28 V2)")]
 pub async fn fetch_usdc_balance_multi(
     rpc_urls: &[&str],
     usdc_contract: &str,
     wallet: &str,
 ) -> Result<Decimal> {
-    fetch_erc20_balance_multi(rpc_urls, usdc_contract, wallet, 6).await
+    fetch_pusd_balance_multi(rpc_urls, usdc_contract, wallet).await
 }
 
-/// Convenience wrapper: query USDC (6-decimal) balance for a wallet.
-pub async fn fetch_usdc_balance(rpc_url: &str, usdc_contract: &str, wallet: &str) -> Result<Decimal> {
-    fetch_erc20_balance(rpc_url, usdc_contract, wallet, 6).await
+/// Backwards-compat alias for [`fetch_pusd_balance`]. See above note.
+#[deprecated(note = "renamed to fetch_pusd_balance (pUSD post 2026-04-28 V2)")]
+pub async fn fetch_usdc_balance(
+    rpc_url: &str,
+    usdc_contract: &str,
+    wallet: &str,
+) -> Result<Decimal> {
+    fetch_pusd_balance(rpc_url, usdc_contract, wallet).await
 }
 
 async fn check_contract_code(rpc_url: &str, contract: &str) -> Result<String> {

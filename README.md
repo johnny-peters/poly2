@@ -1,5 +1,7 @@
 # poly2 快速上手
 
+> **V2 升级状态（2026-04-28 起）**：Polymarket 完成 CLOB V2 + USDC.e → pUSD 迁移。本 repo 已切到官方 V2 SDK [`polymarket_client_sdk_v2`](https://crates.io/crates/polymarket_client_sdk_v2)，**仅 plan-c（智能跟单）已适配 V2 并在线**；plan-a（BTC candle sniper）与 plan-b（双边对冲）仍依赖 V1 假设，已在主调度器里硬性禁用，命中即 `exit(2)`，避免在 V2 后端持续回 `order_version_mismatch`。后续会在单独的 PR 里恢复。
+
 `poly2` 是一个用 Rust 编写的策略交易引擎骨架，当前包含：
 
 - 策略注册与执行框架（含 `ArbitrageStrategy` 和占位 `TodoStrategy`）
@@ -109,7 +111,7 @@ cargo run -- scan-arb
 健康检查还会读取：
 
 - `RPC_URL`
-- `USDC_CONTRACT_ADDRESS`
+- `USDC_CONTRACT_ADDRESS`（V2 cutover 后默认指向 pUSD `0xC011a7E1…`；不写就用默认）
 
 ## 示例：只改最少配置
 

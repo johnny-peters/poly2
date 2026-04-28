@@ -96,10 +96,10 @@ nano src/.env
 至少设置：
 
 ```env
-CLOB_HTTP_URL=https://clob.polymarket.com/
+CLOB_HTTP_URL=https://clob.polymarket.com/   # 2026-04-28 起为 V2 endpoint，不要写 clob-v2.polymarket.com（已退役）
 CLOB_WS_URL=wss://ws-subscriptions-clob.polymarket.com/ws
 RPC_URL=https://polygon-rpc.com
-# USDC_CONTRACT_ADDRESS=...  # 健康检查用，按需
+# USDC_CONTRACT_ADDRESS=0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB  # 健康检查 pUSD 合约（V2 默认值），按需覆盖
 # FETCH_INTERVAL=60          # 主程序市场扫描间隔（秒），默认 60，按需修改
 ```
 

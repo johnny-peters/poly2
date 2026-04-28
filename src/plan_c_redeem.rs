@@ -9,15 +9,20 @@
 //! Two supported redeem paths:
 //!
 //! - **Standard binary markets**: call
-//!   `ConditionalTokens.redeemPositions(usdc, 0x0, conditionId, [1, 2])`.
+//!   `ConditionalTokens.redeemPositions(collateral, 0x0, conditionId, [1, 2])`.
 //!   The contract auto-redeems the caller's full balance for the YES and NO
-//!   outcomes and transfers USDC back.
+//!   outcomes and transfers `collateral` back. After the 2026-04-28 V2 cutover
+//!   `collateral` is **pUSD** (Polymarket USD), not USDC.e. Positions opened
+//!   pre-cutover are still anchored on USDC.e — operators redeeming legacy
+//!   positions must override `PLAN_C_COLLATERAL_ADDRESS` (or the deprecated
+//!   alias `PLAN_C_USDC_ADDRESS`) back to the USDC.e address.
 //!
 //! - **NegRisk multi-outcome markets**: call
 //!   `NegRiskAdapter.redeemPositions(conditionId, [yes_bal, no_bal])`.
-//!   The adapter unwraps `WrappedCollateral` → USDC for us. Because the
-//!   adapter transfers the requested amount from `msg.sender`, we must query
-//!   the caller's ERC1155 balance for both outcome position IDs first.
+//!   The adapter unwraps `WrappedCollateral` → collateral (pUSD post-V2,
+//!   USDC.e pre-V2) for us. Because the adapter transfers the requested
+//!   amount from `msg.sender`, we must query the caller's ERC1155 balance
+//!   for both outcome position IDs first.
 
 use alloy::{
     network::EthereumWallet,
@@ -63,11 +68,44 @@ sol! {
 }
 
 /// Polymarket contract addresses on Polygon mainnet. Override via env if
-/// Polymarket ever redeploys.
+/// Polymarket ever redeploys. Source of truth:
+/// <https://docs.polymarket.com/resources/contracts>.
 pub const DEFAULT_CTF_ADDRESS: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+/// Legacy NegRiskAdapter still listed under "Core Trading Contracts" after the
+/// V2 cutover. Used by `redeem_neg_risk` for the on-chain unwrap call.
 pub const DEFAULT_NEG_RISK_ADAPTER: &str = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296";
-pub const DEFAULT_USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+/// Default collateral token = **pUSD** (Polymarket USD) post 2026-04-28 V2
+/// cutover. Backed 1:1 by USDC, used for all CLOB settlement on V2.
+/// Pre-cutover positions are still anchored on USDC.e — see
+/// `LEGACY_USDCE_ADDRESS` for that.
+pub const DEFAULT_COLLATERAL_ADDRESS: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+/// Bridged USDC.e on Polygon — V1 collateral, only used by post-cutover
+/// startup checks ("you have unwrapped USDC.e — please wrap to pUSD") and by
+/// operators redeeming legacy positions opened before the cutover.
+pub const LEGACY_USDCE_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+/// V2 CollateralOnramp — wraps USDC / USDC.e into pUSD via `wrap()`. We never
+/// call this from the bot (operators wrap manually on polymarket.com), but
+/// log the address whenever we detect unwrapped USDC.e on the funder wallet.
+pub const COLLATERAL_ONRAMP_ADDRESS: &str = "0x93070a847efEf7F70739046A929D47a521F5B8ee";
+/// V2 CtfCollateralAdapter — bridges pUSD ↔ CTF operations (split/merge/redeem)
+/// for non-NegRisk markets. Reserved for future use; current redeem path uses
+/// the standard `ConditionalTokens.redeemPositions(pUSD, …)`, which still
+/// works post-cutover.
+#[allow(dead_code)]
+pub const CTF_COLLATERAL_ADAPTER_ADDRESS: &str = "0xADa100874d00e3331D00F2007a9c336a65009718";
+/// V2 NegRiskCtfCollateralAdapter — pUSD-aware variant for NegRisk markets.
+/// Reserved for future use; current redeem path still goes through
+/// `DEFAULT_NEG_RISK_ADAPTER` (`0xd91E80…`).
+#[allow(dead_code)]
+pub const NEG_RISK_CTF_COLLATERAL_ADAPTER_ADDRESS: &str =
+    "0xAdA200001000ef00D07553cEE7006808F895c6F1";
 pub const DEFAULT_RPC_URL: &str = "https://polygon-rpc.com";
+
+/// Backwards-compat alias kept so callers that still reference
+/// `DEFAULT_USDC_ADDRESS` keep compiling. Points at pUSD post-V2 cutover.
+#[allow(dead_code)]
+#[deprecated(note = "renamed to DEFAULT_COLLATERAL_ADDRESS (pUSD post 2026-04-28 V2)")]
+pub const DEFAULT_USDC_ADDRESS: &str = DEFAULT_COLLATERAL_ADDRESS;
 
 /// All the state we need to perform redemptions from a single wallet.
 pub struct RedeemClient {
@@ -78,7 +116,11 @@ pub struct RedeemClient {
     position_holder: Address,
     ctf_address: Address,
     neg_risk_adapter: Address,
-    usdc_address: Address,
+    /// Settlement collateral token. Post 2026-04-28 V2 cutover this is pUSD
+    /// (`0xC011a7E1…`); pre-cutover positions used USDC.e (`0x2791Bca1…`).
+    /// The CTF identifies positions by `(collateral, collectionId)`, so this
+    /// must match the collateral the position was originally minted with.
+    collateral_address: Address,
     /// WrappedCollateral address used by neg-risk positions. Looked up from
     /// the adapter at construction time so we don't have to hardcode it.
     wcol_address: Address,
@@ -91,7 +133,7 @@ impl RedeemClient {
         position_holder: Address,
         ctf_address: Address,
         neg_risk_adapter: Address,
-        usdc_address: Address,
+        collateral_address: Address,
     ) -> anyhow::Result<Self> {
         let signer = PrivateKeySigner::from_str(private_key.trim())
             .context("invalid PLAN_C_REDEEM private key")?;
@@ -119,7 +161,7 @@ impl RedeemClient {
             position_holder,
             ctf_address,
             neg_risk_adapter,
-            usdc_address,
+            collateral_address,
             wcol_address,
         })
     }
@@ -133,13 +175,14 @@ impl RedeemClient {
         Ok(denom > U256::ZERO)
     }
 
-    /// Redeem a standard (non neg-risk) binary market. Transfers USDC to
+    /// Redeem a standard (non neg-risk) binary market. Transfers settlement
+    /// collateral (pUSD post-V2, USDC.e for legacy positions) to
     /// `position_holder` for the full outstanding balance on both outcomes.
     pub async fn redeem_standard(&self, condition_id: B256) -> anyhow::Result<B256> {
         let ctf = IConditionalTokens::new(self.ctf_address, &self.provider);
         let index_sets = vec![U256::from(1_u64), U256::from(2_u64)];
         let pending = ctf
-            .redeemPositions(self.usdc_address, B256::ZERO, condition_id, index_sets)
+            .redeemPositions(self.collateral_address, B256::ZERO, condition_id, index_sets)
             .send()
             .await
             .context("CTF.redeemPositions(standard) send failed")?;
@@ -154,7 +197,9 @@ impl RedeemClient {
 
     /// Redeem a neg-risk market. Queries the caller's balance for both YES
     /// and NO outcome position tokens on the underlying CTF (collateral =
-    /// WrappedCollateral) and passes them as `[yes_bal, no_bal]`.
+    /// WrappedCollateral) and passes them as `[yes_bal, no_bal]`. The
+    /// adapter unwraps to the underlying collateral (pUSD post-V2, USDC.e
+    /// for legacy positions) and forwards it to `position_holder`.
     pub async fn redeem_neg_risk(&self, condition_id: B256) -> anyhow::Result<B256> {
         let ctf = IConditionalTokens::new(self.ctf_address, &self.provider);
 

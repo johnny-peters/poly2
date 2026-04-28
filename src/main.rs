@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Context};
 use chrono::Utc;
-use polymarket_client_sdk::auth::ExposeSecret as _;
-use polymarket_client_sdk::auth::{LocalSigner as PmLocalSigner, Signer as _};
-use polymarket_client_sdk::clob::types::{Side as PmSide, SignatureType as PmSignatureType};
-use polymarket_client_sdk::clob::{Client as PmClobClient, Config as PmClobConfig};
-use polymarket_client_sdk::types::{Address as PmAddress, Decimal as PmDecimal, U256 as PmU256};
-use polymarket_client_sdk::{
+use polymarket_client_sdk_v2::auth::ExposeSecret as _;
+use polymarket_client_sdk_v2::auth::{LocalSigner as PmLocalSigner, Signer as _};
+use polymarket_client_sdk_v2::clob::types::{Side as PmSide, SignatureType as PmSignatureType};
+use polymarket_client_sdk_v2::clob::{Client as PmClobClient, Config as PmClobConfig};
+use polymarket_client_sdk_v2::types::{Address as PmAddress, Decimal as PmDecimal, U256 as PmU256};
+use polymarket_client_sdk_v2::{
     derive_proxy_wallet, derive_safe_wallet, POLYGON as PM_POLYGON, PRIVATE_KEY_VAR,
 };
 use futures::{SinkExt, StreamExt};
@@ -28,7 +28,13 @@ use poly2::{
     TradingEngine,
 };
 
+// plan-a / plan-b are disabled pending Polymarket V2 (2026-04-28) adaptation
+// — the modules still compile (dead code is suppressed) so we can re-enable
+// them quickly once they're ported; main's strategy dispatch refuses to enter
+// either entry point in the meantime.
+#[allow(dead_code)]
 mod plan_a;
+#[allow(dead_code)]
 mod plan_b;
 mod plan_c;
 mod plan_c_redeem;
@@ -432,36 +438,53 @@ async fn main() -> anyhow::Result<()> {
     let cli_plan_b = args.iter().any(|a| a == "plan-b" || a == "plan_b" || a == "planb");
     let cli_plan_c = args.iter().any(|a| a == "plan-c" || a == "plan_c" || a == "planc");
 
-    let (use_plan_b, use_plan_c, plan_source) = if cli_plan_a {
-        (false, false, "cli")
-    } else if cli_plan_b {
-        (true, false, "cli")
-    } else if cli_plan_c {
-        (false, true, "cli")
+    // Polymarket completed the CLOB V2 cutover on 2026-04-28 (USDC.e -> pUSD,
+    // EIP-712 v=1 -> v=2, new Order field set). plan-c has been ported to the
+    // V2 SDK; plan-a (BTC candle sniper) and plan-b (双边对冲) still rely on
+    // V1-only assumptions and would silently submit orders that the V2 backend
+    // rejects with `order_version_mismatch`. Hard-disable both entry points
+    // until they're individually adapted, otherwise the bot would burn the
+    // wallet on no-ops.
+    let plan_a_b_disabled_reason = "plan-a / plan-b are temporarily disabled pending Polymarket V2 (2026-04-28) adaptation. Run plan-c instead, or wait for the next release.";
+    if cli_plan_a || cli_plan_b {
+        eprintln!("plan_c: {plan_a_b_disabled_reason}");
+        std::process::exit(2);
+    }
+
+    let (use_plan_c, plan_source) = if cli_plan_c {
+        (true, "cli")
     } else {
         match resolve_runtime_var("DEFAULT_PLAN", dotenv_path)
             .map(|v| v.trim().to_ascii_lowercase())
             .as_deref()
         {
-            Some("plan-a") | Some("plan_a") | Some("plana") | Some("a") => (false, false, "env"),
-            Some("plan-b") | Some("plan_b") | Some("planb") | Some("b") => (true, false, "env"),
-            Some("plan-c") | Some("plan_c") | Some("planc") | Some("c") => (false, true, "env"),
+            Some("plan-a") | Some("plan_a") | Some("plana") | Some("a") => {
+                eprintln!("plan_c: DEFAULT_PLAN=plan-a — {plan_a_b_disabled_reason}");
+                std::process::exit(2);
+            }
+            Some("plan-b") | Some("plan_b") | Some("planb") | Some("b") => {
+                eprintln!("plan_c: DEFAULT_PLAN=plan-b — {plan_a_b_disabled_reason}");
+                std::process::exit(2);
+            }
+            Some("plan-c") | Some("plan_c") | Some("planc") | Some("c") => (true, "env"),
             Some(other) if !other.is_empty() => {
                 eprintln!(
-                    "warn: DEFAULT_PLAN='{other}' not recognised, falling back to plan-a (accepted: plan-a|plan-b|plan-c)"
+                    "warn: DEFAULT_PLAN='{other}' not recognised, falling back to plan-c (plan-a / plan-b are disabled pending V2 adaptation)"
                 );
-                (false, false, "default")
+                (true, "default")
             }
-            _ => (false, false, "default"),
+            _ => {
+                eprintln!(
+                    "warn: DEFAULT_PLAN unset, falling back to plan-c (plan-a / plan-b are disabled pending V2 adaptation)"
+                );
+                (true, "default")
+            }
         }
     };
+    let use_plan_b = false;
 
     if use_plan_c {
         println!("strategy=plan_c (智能跟单) [source={plan_source}]");
-    } else if use_plan_b {
-        println!("strategy=plan_b (双边对冲) [source={plan_source}]");
-    } else {
-        println!("strategy=plan_a (单边趋势) [source={plan_source}]");
     }
 
     if let Some(http_url) = &execution_settings.polymarket_http_url {
@@ -491,13 +514,12 @@ async fn main() -> anyhow::Result<()> {
             execution_settings.max_retries,
             execution_settings.timeout_secs * 100,
         );
-        if use_plan_c {
-            plan_c::run_plan_c_loop(&context, &risk_engine, &retrying, dotenv_path).await;
-        } else if use_plan_b {
-            plan_b::run_plan_b_loop(fetch_interval_secs, &context, &risk_engine, &retrying, dotenv_path).await;
-        } else {
-            plan_a::run_btc_candle_loop(fetch_interval_secs, &context, &risk_engine, &retrying, dotenv_path).await;
-        }
+        // plan-a / plan-b dispatch removed pending V2 adaptation; we exited
+        // earlier if those were selected, so use_plan_c is always true here.
+        let _ = use_plan_b;
+        let _ = use_plan_c;
+        let _ = fetch_interval_secs;
+        plan_c::run_plan_c_loop(&context, &risk_engine, &retrying, dotenv_path).await;
     } else {
         println!("execution mode=mock (polymarket_http_url is empty)");
         let retrying = RetryingExecutionClient::new(
@@ -505,13 +527,10 @@ async fn main() -> anyhow::Result<()> {
             execution_settings.max_retries,
             execution_settings.timeout_secs * 100,
         );
-        if use_plan_c {
-            plan_c::run_plan_c_loop(&context, &risk_engine, &retrying, dotenv_path).await;
-        } else if use_plan_b {
-            plan_b::run_plan_b_loop(fetch_interval_secs, &context, &risk_engine, &retrying, dotenv_path).await;
-        } else {
-            plan_a::run_btc_candle_loop(fetch_interval_secs, &context, &risk_engine, &retrying, dotenv_path).await;
-        }
+        let _ = use_plan_b;
+        let _ = use_plan_c;
+        let _ = fetch_interval_secs;
+        plan_c::run_plan_c_loop(&context, &risk_engine, &retrying, dotenv_path).await;
     }
 
     Ok(())
